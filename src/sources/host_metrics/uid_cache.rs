@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
@@ -51,10 +49,10 @@ impl UidCache {
             self.last_eviction = now;
         }
 
-        if let Some(entry) = self.cache.get(&uid) {
-            if now.duration_since(entry.inserted_at) < self.ttl {
-                return entry.username.clone();
-            }
+        if let Some(entry) = self.cache.get(&uid)
+            && now.duration_since(entry.inserted_at) < self.ttl
+        {
+            return entry.username.clone();
         }
 
         let username = lookup_username(uid).unwrap_or_else(|| uid.to_string());

@@ -27,15 +27,14 @@ fn bench_process_metrics(c: &mut Criterion) {
     group.bench_function("all_processes_cpu_memory_only", |b| {
         b.iter_custom(|iters| {
             rt.block_on(async {
-                let config: HostMetricsConfig =
-                    serde_json::from_value(serde_json::json!({
-                        "process": {
-                            "metrics": {
-                                "includes": ["process_cpu_*", "process_memory_*"]
-                            }
+                let config: HostMetricsConfig = serde_json::from_value(serde_json::json!({
+                    "process": {
+                        "metrics": {
+                            "includes": ["process_cpu_*", "process_memory_*"]
                         }
-                    }))
-                    .unwrap();
+                    }
+                }))
+                .unwrap();
                 let start = std::time::Instant::now();
                 for _ in 0..iters {
                     let mut host = HostMetrics::new(config.clone());
@@ -52,15 +51,14 @@ fn bench_process_metrics(c: &mut Criterion) {
     group.bench_function("single_process_all_metrics", |b| {
         b.iter_custom(|iters| {
             rt.block_on(async {
-                let config: HostMetricsConfig =
-                    serde_json::from_value(serde_json::json!({
-                        "process": {
-                            "processes": {
-                                "includes": ["vector"]
-                            }
+                let config: HostMetricsConfig = serde_json::from_value(serde_json::json!({
+                    "process": {
+                        "processes": {
+                            "includes": ["vector"]
                         }
-                    }))
-                    .unwrap();
+                    }
+                }))
+                .unwrap();
                 let start = std::time::Instant::now();
                 for _ in 0..iters {
                     let mut host = HostMetrics::new(config.clone());
@@ -91,15 +89,14 @@ fn bench_process_metrics_scaling(c: &mut Criterion) {
             |b, &filter| {
                 b.iter_custom(|iters| {
                     rt.block_on(async {
-                        let config: HostMetricsConfig =
-                            serde_json::from_value(serde_json::json!({
-                                "process": {
-                                    "metrics": {
-                                        "includes": [filter]
-                                    }
+                        let config: HostMetricsConfig = serde_json::from_value(serde_json::json!({
+                            "process": {
+                                "metrics": {
+                                    "includes": [filter]
                                 }
-                            }))
-                            .unwrap();
+                            }
+                        }))
+                        .unwrap();
                         let start = std::time::Instant::now();
                         for _ in 0..iters {
                             let mut host = HostMetrics::new(config.clone());
