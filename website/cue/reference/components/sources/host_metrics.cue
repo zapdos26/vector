@@ -142,11 +142,6 @@ components: sources: host_metrics: {
 			relevant_when: "OS is Linux"
 			tags: _process_identity_tags & {
 				collector: examples: ["process"]
-				thread_ids: {
-					description: "The thread IDs belonging to the process (multi-value tag)."
-					required:    false
-					examples: ["12345"]
-				}
 			}
 		}
 		process_minor_page_faults: _host & _process_memory_gauge & _process_linux & {

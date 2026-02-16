@@ -76,7 +76,7 @@ const MINOR_PAGE_FAULTS: &str = "process_minor_page_faults";
 const MAJOR_PAGE_FAULTS: &str = "process_major_page_faults";
 
 /// Format a ProcessStatus as a lowercase tag value.
-fn format_process_status(status: sysinfo::ProcessStatus) -> &'static str {
+const fn format_process_status(status: sysinfo::ProcessStatus) -> &'static str {
     use sysinfo::ProcessStatus;
     match status {
         ProcessStatus::Idle => "idle",
@@ -150,7 +150,7 @@ fn resolve_shm_owner(
     // Only read maps if the process actually uses shared memory
     let has_shm = proc_status
         .and_then(|s| s.rssshmem)
-        .map_or(false, |v| v > 0);
+        .is_some_and(|v| v > 0);
     if !has_shm {
         return None;
     }
@@ -185,11 +185,8 @@ impl HostMetrics {
             .with_root(UpdateKind::OnlyIfNotSet)
             .with_cwd(UpdateKind::OnlyIfNotSet);
 
-        self.system.refresh_processes_specifics(
-            ProcessesToUpdate::All,
-            true,
-            refresh_kind,
-        );
+        self.system
+            .refresh_processes_specifics(ProcessesToUpdate::All, true, refresh_kind);
         output.name = "process";
         #[cfg(target_os = "linux")]
         let shm_info = load_shm_info();
@@ -265,8 +262,7 @@ impl HostMetrics {
                 procfs::process::Process::new(pid_i32).ok().map(|p| {
                     let stat = p.stat().ok();
                     let status = p.status().ok();
-                    let shm_owner_pid =
-                        resolve_shm_owner(pid_i32, status.as_ref(), &p, &shm_info);
+                    let shm_owner_pid = resolve_shm_owner(pid_i32, status.as_ref(), &p, &shm_info);
                     (stat, status, shm_owner_pid)
                 })
             };
@@ -330,13 +326,21 @@ impl HostMetrics {
                 output.gauge(MEMORY_USAGE, process.memory() as f64, memory_tags.clone());
             }
             if emit(MEMORY_VIRTUAL_USAGE) {
-                output.gauge(MEMORY_VIRTUAL_USAGE, process.virtual_memory() as f64, memory_tags.clone());
+                output.gauge(
+                    MEMORY_VIRTUAL_USAGE,
+                    process.virtual_memory() as f64,
+                    memory_tags.clone(),
+                );
             }
             if emit(RUNTIME) {
                 output.counter(RUNTIME, process.run_time() as f64, runtime_tags);
             }
             if emit(ACCUMULATED_CPU_TIME) {
-                output.gauge(ACCUMULATED_CPU_TIME, process.accumulated_cpu_time() as f64, identity.clone());
+                output.gauge(
+                    ACCUMULATED_CPU_TIME,
+                    process.accumulated_cpu_time() as f64,
+                    identity.clone(),
+                );
             }
 
             let du = process.disk_usage();
@@ -347,33 +351,35 @@ impl HostMetrics {
                 output.gauge(DISK_WRITTEN_BYTES, du.written_bytes as f64, io_tags.clone());
             }
             if emit(TOTAL_DISK_READ_BYTES) {
-                output.gauge(TOTAL_DISK_READ_BYTES, du.total_read_bytes as f64, io_tags.clone());
+                output.gauge(
+                    TOTAL_DISK_READ_BYTES,
+                    du.total_read_bytes as f64,
+                    io_tags.clone(),
+                );
             }
             if emit(TOTAL_DISK_WRITTEN_BYTES) {
-                output.gauge(TOTAL_DISK_WRITTEN_BYTES, du.total_written_bytes as f64, io_tags.clone());
+                output.gauge(
+                    TOTAL_DISK_WRITTEN_BYTES,
+                    du.total_written_bytes as f64,
+                    io_tags.clone(),
+                );
             }
 
-            if emit(OPEN_FILES) {
-                if let Some(open) = process.open_files() {
-                    let mut open_tags = io_tags.clone();
-                    if let Some(limit) = process.open_files_limit() {
-                        open_tags.replace("open_files_limit".into(), limit.to_string());
-                    }
-                    output.gauge(OPEN_FILES, open as f64, open_tags);
+            if emit(OPEN_FILES)
+                && let Some(open) = process.open_files()
+            {
+                let mut open_tags = io_tags.clone();
+                if let Some(limit) = process.open_files_limit() {
+                    open_tags.replace("open_files_limit".into(), limit.to_string());
                 }
+                output.gauge(OPEN_FILES, open as f64, open_tags);
             }
 
             #[cfg(target_os = "linux")]
-            if emit(TASK_COUNT) {
-                if let Some(tasks) = process.tasks() {
-                    let mut task_tags = identity.clone();
-                    let thread_ids: Vec<String> =
-                        tasks.iter().map(|t| t.as_u32().to_string()).collect();
-                    for tid in &thread_ids {
-                        task_tags.insert("thread_ids".into(), tid.clone());
-                    }
-                    output.gauge(TASK_COUNT, tasks.len() as f64, task_tags);
-                }
+            if emit(TASK_COUNT)
+                && let Some(tasks) = process.tasks()
+            {
+                output.gauge(TASK_COUNT, tasks.len() as f64, identity.clone());
             }
 
             #[cfg(target_os = "linux")]
@@ -387,15 +393,19 @@ impl HostMetrics {
                     }
                 }
                 if let Some(status) = status_opt {
-                    if emit(VOLUNTARY_CONTEXT_SWITCHES) {
-                        if let Some(vol) = status.voluntary_ctxt_switches {
-                            output.gauge(VOLUNTARY_CONTEXT_SWITCHES, vol as f64, identity.clone());
-                        }
+                    if emit(VOLUNTARY_CONTEXT_SWITCHES)
+                        && let Some(vol) = status.voluntary_ctxt_switches
+                    {
+                        output.gauge(VOLUNTARY_CONTEXT_SWITCHES, vol as f64, identity.clone());
                     }
-                    if emit(INVOLUNTARY_CONTEXT_SWITCHES) {
-                        if let Some(nonvol) = status.nonvoluntary_ctxt_switches {
-                            output.gauge(INVOLUNTARY_CONTEXT_SWITCHES, nonvol as f64, identity.clone());
-                        }
+                    if emit(INVOLUNTARY_CONTEXT_SWITCHES)
+                        && let Some(nonvol) = status.nonvoluntary_ctxt_switches
+                    {
+                        output.gauge(
+                            INVOLUNTARY_CONTEXT_SWITCHES,
+                            nonvol as f64,
+                            identity.clone(),
+                        );
                     }
                 }
             }
@@ -413,9 +423,7 @@ mod tests {
 
     async fn get_metrics(config: HostMetricsConfig) -> Vec<vector_lib::event::Metric> {
         let mut buffer = MetricsBuffer::new(None);
-        HostMetrics::new(config)
-            .process_metrics(&mut buffer)
-            .await;
+        HostMetrics::new(config).process_metrics(&mut buffer).await;
         buffer.metrics
     }
 
@@ -431,8 +439,7 @@ mod tests {
         assert!(!metrics.is_empty());
         assert!(metrics.iter().all(|m| m.name().starts_with("process_")));
 
-        let names: std::collections::HashSet<&str> =
-            metrics.iter().map(|m| m.name()).collect();
+        let names: std::collections::HashSet<&str> = metrics.iter().map(|m| m.name()).collect();
 
         // Core metrics
         assert!(names.contains(CPU_USAGE));
@@ -482,12 +489,16 @@ mod tests {
 
         // start_time should be on runtime metrics
         assert!(runtime_metrics.iter().any(|m| {
-            m.tags().map(|t| t.contains_key("start_time")).unwrap_or(false)
+            m.tags()
+                .map(|t| t.contains_key("start_time"))
+                .unwrap_or(false)
         }));
 
         // start_time should NOT be on any other metric
         assert!(non_runtime.iter().all(|m| {
-            !m.tags().map(|t| t.contains_key("start_time")).unwrap_or(false)
+            !m.tags()
+                .map(|t| t.contains_key("start_time"))
+                .unwrap_or(false)
         }));
     }
 
@@ -500,14 +511,18 @@ mod tests {
         let non_cpu: Vec<_> = metrics.iter().filter(|m| m.name() != CPU_USAGE).collect();
 
         assert!(!cpu_metrics.is_empty());
-        assert!(cpu_metrics.iter().any(|m| {
-            m.tags().map(|t| t.contains_key("nice")).unwrap_or(false)
-        }));
+        assert!(
+            cpu_metrics
+                .iter()
+                .any(|m| { m.tags().map(|t| t.contains_key("nice")).unwrap_or(false) })
+        );
 
         // nice should NOT be on any other metric
-        assert!(non_cpu.iter().all(|m| {
-            !m.tags().map(|t| t.contains_key("nice")).unwrap_or(false)
-        }));
+        assert!(
+            non_cpu
+                .iter()
+                .all(|m| { !m.tags().map(|t| t.contains_key("nice")).unwrap_or(false) })
+        );
     }
 
     #[cfg(unix)]
@@ -516,8 +531,10 @@ mod tests {
         let metrics = get_default_metrics().await;
 
         let io_names = [
-            DISK_READ_BYTES, DISK_WRITTEN_BYTES,
-            TOTAL_DISK_READ_BYTES, TOTAL_DISK_WRITTEN_BYTES,
+            DISK_READ_BYTES,
+            DISK_WRITTEN_BYTES,
+            TOTAL_DISK_READ_BYTES,
+            TOTAL_DISK_WRITTEN_BYTES,
             OPEN_FILES,
         ];
         let io_metrics: Vec<_> = metrics
@@ -527,18 +544,18 @@ mod tests {
 
         if !io_metrics.is_empty() {
             // At least some I/O metrics should have cwd/root
-            let has_cwd = io_metrics.iter().any(|m| {
-                m.tags().map(|t| t.contains_key("cwd")).unwrap_or(false)
-            });
+            let has_cwd = io_metrics
+                .iter()
+                .any(|m| m.tags().map(|t| t.contains_key("cwd")).unwrap_or(false));
             // cwd may be empty for some processes, so just check it doesn't
             // appear on non-I/O metrics
             let non_io: Vec<_> = metrics
                 .iter()
                 .filter(|m| !io_names.contains(&m.name()))
                 .collect();
-            let cwd_on_non_io = non_io.iter().any(|m| {
-                m.tags().map(|t| t.contains_key("cwd")).unwrap_or(false)
-            });
+            let cwd_on_non_io = non_io
+                .iter()
+                .any(|m| m.tags().map(|t| t.contains_key("cwd")).unwrap_or(false));
             // cwd should NOT appear outside I/O metrics
             assert!(!cwd_on_non_io, "cwd tag found on non-I/O metric");
             let _ = has_cwd; // used for documentation, may be false
@@ -549,10 +566,7 @@ mod tests {
     async fn open_files_has_limit_tag() {
         let metrics = get_default_metrics().await;
 
-        let open_files: Vec<_> = metrics
-            .iter()
-            .filter(|m| m.name() == OPEN_FILES)
-            .collect();
+        let open_files: Vec<_> = metrics.iter().filter(|m| m.name() == OPEN_FILES).collect();
 
         // open_files_limit should be a tag on open_files, not a separate metric
         assert_eq!(count_name(&metrics, "process_open_files_limit"), 0);
@@ -594,8 +608,7 @@ mod tests {
     async fn generates_linux_procfs_metrics() {
         let metrics = get_default_metrics().await;
 
-        let names: std::collections::HashSet<&str> =
-            metrics.iter().map(|m| m.name()).collect();
+        let names: std::collections::HashSet<&str> = metrics.iter().map(|m| m.name()).collect();
 
         assert!(names.contains(MINOR_PAGE_FAULTS));
         assert!(names.contains(MAJOR_PAGE_FAULTS));
@@ -636,7 +649,11 @@ mod tests {
         assert!(!metrics.is_empty());
         // No disk metrics should be present
         assert!(!metrics.iter().any(|m| m.name().starts_with("process_disk")));
-        assert!(!metrics.iter().any(|m| m.name().starts_with("process_total")));
+        assert!(
+            !metrics
+                .iter()
+                .any(|m| m.name().starts_with("process_total"))
+        );
         // But other metrics should still be there
         assert!(metrics.iter().any(|m| m.name() == CPU_USAGE));
     }
@@ -646,8 +663,7 @@ mod tests {
         // An empty (default) FilterList should not filter anything out.
         // We verify by checking that every known metric name appears.
         let metrics = get_default_metrics().await;
-        let names: std::collections::HashSet<&str> =
-            metrics.iter().map(|m| m.name()).collect();
+        let names: std::collections::HashSet<&str> = metrics.iter().map(|m| m.name()).collect();
 
         assert!(names.contains(CPU_USAGE));
         assert!(names.contains(MEMORY_USAGE));
