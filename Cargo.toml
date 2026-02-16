@@ -457,6 +457,7 @@ netlink-packet-utils = "0.5.2"
 netlink-packet-sock-diag = "0.4.2"
 netlink-packet-core = "0.7.0"
 netlink-sys = { version = "0.8.7", features = ["tokio_socket"] }
+procfs = { version = "0.18", default-features = false }
 
 [build-dependencies]
 prost-build = { workspace = true, optional = true }

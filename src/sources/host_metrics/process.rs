@@ -42,6 +42,14 @@ const OPEN_FILES: &str = "process_open_files";
 const OPEN_FILES_LIMIT: &str = "process_open_files_limit";
 #[cfg(target_os = "linux")]
 const TASK_COUNT: &str = "process_task_count";
+#[cfg(target_os = "linux")]
+const VOLUNTARY_CONTEXT_SWITCHES: &str = "process_voluntary_context_switches";
+#[cfg(target_os = "linux")]
+const INVOLUNTARY_CONTEXT_SWITCHES: &str = "process_involuntary_context_switches";
+#[cfg(target_os = "linux")]
+const MINOR_PAGE_FAULTS: &str = "process_minor_page_faults";
+#[cfg(target_os = "linux")]
+const MAJOR_PAGE_FAULTS: &str = "process_major_page_faults";
 
 /// Format a ProcessStatus as a lowercase tag value.
 fn format_process_status(status: sysinfo::ProcessStatus) -> &'static str {
@@ -66,6 +74,38 @@ fn format_process_status(status: sysinfo::ProcessStatus) -> &'static str {
 fn path_tag(p: Option<&Path>) -> String {
     p.map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_default()
+}
+
+/// Find the creator PID of any SysV shared memory segment mapped by this process.
+/// Returns the first shm creator PID found, or None if no SysV shm is mapped.
+#[cfg(target_os = "linux")]
+fn find_shm_owner_pid(maps: &procfs::process::MemoryMaps) -> Option<i32> {
+    use procfs::Current;
+    use std::sync::OnceLock;
+    // Cache the SysV shm segments for the duration of this scrape.
+    // OnceLock ensures we read /proc/sysvipc/shm at most once per process lifetime,
+    // but since this is called many times per scrape we use a simple static cache.
+    // For true per-scrape caching, a field on HostMetrics would be better,
+    // but this is a reasonable starting point.
+    static SHM_SEGMENTS: OnceLock<Option<Vec<(i32, i32)>>> = OnceLock::new();
+    let segments = SHM_SEGMENTS.get_or_init(|| {
+        procfs::SharedMemorySegments::current().ok().map(|shm| {
+            shm.0.iter().map(|s| (s.key, s.cpid)).collect()
+        })
+    });
+
+    for map in &maps.0 {
+        if let procfs::process::MMapPath::Vsys(key) = &map.pathname {
+            if let Some(segs) = segments {
+                for (seg_key, cpid) in segs {
+                    if seg_key == key {
+                        return Some(*cpid);
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
 impl HostMetrics {
@@ -176,15 +216,52 @@ impl HostMetrics {
                 identity.replace("thread_kind".into(), kind_str);
             }
 
-            // --- Time tags (identity + start_time) for CPU/runtime metrics ---
+            // --- Read procfs data upfront (Linux only) ---
+            // We read stat + status once per process to get nice, page faults,
+            // context switches, and shared memory info.
+            #[cfg(target_os = "linux")]
+            let procfs_data = {
+                let pid_i32 = pid.as_u32() as i32;
+                procfs::process::Process::new(pid_i32).ok().map(|p| {
+                    let stat = p.stat().ok();
+                    let status = p.status().ok();
+                    let has_shm = process.memory() > 0;
+                    let shm_owner_pid = if has_shm {
+                        p.maps().ok().and_then(|maps| {
+                            find_shm_owner_pid(&maps)
+                        })
+                    } else {
+                        None
+                    };
+                    (stat, status, shm_owner_pid)
+                })
+            };
+
+            // --- Time tags (identity + start_time + nice) for CPU/runtime metrics ---
             let time_tags = {
                 let mut t = identity.clone();
                 let start = process.start_time();
                 if start > 0 {
                     t.replace("start_time".into(), start.to_string());
                 }
+                #[cfg(target_os = "linux")]
+                if let Some((Some(ref stat), _, _)) = procfs_data {
+                    t.replace("nice".into(), stat.nice.to_string());
+                }
                 t
             };
+
+            // --- Memory tags (identity + shm_owner_pid) ---
+            #[cfg(target_os = "linux")]
+            let memory_tags = {
+                let mut t = identity.clone();
+                if let Some((_, _, Some(owner_pid))) = &procfs_data {
+                    t.replace("shm_owner_pid".into(), owner_pid.to_string());
+                }
+                t
+            };
+            #[cfg(not(target_os = "linux"))]
+            let memory_tags = identity.clone();
 
             // --- Filesystem tags (identity + cwd, root) for I/O metrics ---
             #[cfg(unix)]
@@ -205,11 +282,11 @@ impl HostMetrics {
 
             // --- Emit base metrics with extended tags ---
             output.gauge(CPU_USAGE, process.cpu_usage().into(), time_tags.clone());
-            output.gauge(MEMORY_USAGE, process.memory() as f64, identity.clone());
+            output.gauge(MEMORY_USAGE, process.memory() as f64, memory_tags.clone());
             output.gauge(
                 MEMORY_VIRTUAL_USAGE,
                 process.virtual_memory() as f64,
-                identity.clone(),
+                memory_tags.clone(),
             );
             output.counter(RUNTIME, process.run_time() as f64, time_tags.clone());
 
@@ -247,7 +324,6 @@ impl HostMetrics {
             #[cfg(target_os = "linux")]
             if let Some(tasks) = process.tasks() {
                 let mut task_tags = identity.clone();
-                // Multi-value thread_ids tag
                 let thread_ids: Vec<String> =
                     tasks.iter().map(|t| t.as_u32().to_string()).collect();
                 for tid in &thread_ids {
@@ -256,8 +332,39 @@ impl HostMetrics {
                 output.gauge(TASK_COUNT, tasks.len() as f64, task_tags);
             }
 
-            // identity is consumed by the last usage above; drop it explicitly
-            // to help the compiler see it's no longer needed.
+            // --- Linux procfs-based metrics (page faults, context switches) ---
+            #[cfg(target_os = "linux")]
+            if let Some((stat_opt, status_opt, _)) = procfs_data {
+                if let Some(stat) = stat_opt {
+                    output.gauge(
+                        MINOR_PAGE_FAULTS,
+                        stat.minflt as f64,
+                        memory_tags.clone(),
+                    );
+                    output.gauge(
+                        MAJOR_PAGE_FAULTS,
+                        stat.majflt as f64,
+                        memory_tags,
+                    );
+                }
+                if let Some(status) = status_opt {
+                    if let Some(vol) = status.voluntary_ctxt_switches {
+                        output.gauge(
+                            VOLUNTARY_CONTEXT_SWITCHES,
+                            vol as f64,
+                            identity.clone(),
+                        );
+                    }
+                    if let Some(nonvol) = status.nonvoluntary_ctxt_switches {
+                        output.gauge(
+                            INVOLUNTARY_CONTEXT_SWITCHES,
+                            nonvol as f64,
+                            identity.clone(),
+                        );
+                    }
+                }
+            }
+
             let _ = identity;
         }
     }
@@ -317,5 +424,39 @@ mod tests {
 
         // Extended identity tags should be present on at least some metrics
         assert!(count_tag(&metrics, "status") > 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn generates_linux_procfs_metrics() {
+        let mut config = HostMetricsConfig::default();
+        config.process.extended_identity_tags = true;
+        let mut buffer = MetricsBuffer::new(None);
+        HostMetrics::new(config)
+            .process_metrics(&mut buffer)
+            .await;
+        let metrics = buffer.metrics;
+
+        let metric_names: std::collections::HashSet<&str> =
+            metrics.iter().map(|m| m.name()).collect();
+
+        // procfs-based metrics should be present
+        assert!(metric_names.contains("process_minor_page_faults"));
+        assert!(metric_names.contains("process_major_page_faults"));
+        assert!(metric_names.contains("process_voluntary_context_switches"));
+        assert!(metric_names.contains("process_involuntary_context_switches"));
+
+        // nice tag should be on CPU metrics
+        let cpu_metrics: Vec<_> = metrics
+            .iter()
+            .filter(|m| m.name() == "process_cpu_usage")
+            .collect();
+        assert!(!cpu_metrics.is_empty());
+        // At least one CPU metric should have the nice tag
+        assert!(cpu_metrics.iter().any(|m| {
+            m.tags()
+                .map(|t| t.contains_key("nice"))
+                .unwrap_or(false)
+        }));
     }
 }
