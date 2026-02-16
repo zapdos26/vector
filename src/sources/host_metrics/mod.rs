@@ -41,7 +41,7 @@ mod process;
 #[cfg(target_os = "linux")]
 mod tcp;
 #[allow(dead_code)]
-mod uid_cache;
+pub mod uid_cache;
 
 /// Collector types.
 #[serde_as]
@@ -365,10 +365,11 @@ pub struct HostMetrics {
 impl HostMetrics {
     #[cfg(not(target_os = "linux"))]
     pub fn new(config: HostMetricsConfig) -> Self {
+        let uid_ttl = std::time::Duration::from_secs(config.process.uid_cache_ttl_secs);
         Self {
             config,
             system: System::new(),
-            uid_cache: uid_cache::UidCache::new(),
+            uid_cache: uid_cache::UidCache::with_ttl(uid_ttl),
             events_received: register!(EventsReceived),
         }
     }
@@ -377,11 +378,12 @@ impl HostMetrics {
     pub fn new(config: HostMetricsConfig) -> Self {
         let cgroups = config.cgroups.clone().unwrap_or_default();
         let root_cgroup = cgroups::CGroupRoot::new(&cgroups);
+        let uid_ttl = std::time::Duration::from_secs(config.process.uid_cache_ttl_secs);
         Self {
             config,
             system: System::new(),
             root_cgroup,
-            uid_cache: uid_cache::UidCache::new(),
+            uid_cache: uid_cache::UidCache::with_ttl(uid_ttl),
             events_received: register!(EventsReceived),
         }
     }

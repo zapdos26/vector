@@ -108,11 +108,59 @@ components: sources: host_metrics: {
 			type:        "gauge"
 		}
 
-		// Host process
-		process_runtime: _host & _process_counter & {description: "The process uptime."}
-		process_cpu_usage: _host & _process_gauge & {description: "The process CPU usage."}
-		process_memory_usage: _host & _process_gauge & {description: "The process memory usage."}
-		process_memory_virtual_usage: _host & _process_gauge & {description: "The process virtual memory usage."}
+		// Host process — core metrics
+		process_cpu_usage: _host & _process_cpu_gauge & {description: "The process CPU usage percentage."}
+		process_memory_usage: _host & _process_memory_gauge & {description: "The process resident memory usage in bytes."}
+		process_memory_virtual_usage: _host & _process_memory_gauge & {description: "The process virtual memory usage in bytes."}
+		process_runtime: _host & _process_runtime_counter & {description: "The process uptime in seconds."}
+		process_accumulated_cpu_time: _host & _process_gauge & {description: "The total accumulated CPU time of the process in seconds."}
+
+		// Host process — disk I/O
+		process_disk_read_bytes: _host & _process_io_gauge & {description: "The number of bytes read by the process since the last scrape."}
+		process_disk_written_bytes: _host & _process_io_gauge & {description: "The number of bytes written by the process since the last scrape."}
+		process_total_disk_read_bytes: _host & _process_io_gauge & {description: "The total number of bytes read by the process since it started."}
+		process_total_disk_written_bytes: _host & _process_io_gauge & {description: "The total number of bytes written by the process since it started."}
+
+		// Host process — filesystem
+		process_open_files: _host & {
+			description: "The number of open file descriptors held by the process."
+			type:        "gauge"
+			tags: _process_identity_tags & _process_io_extra_tags & {
+				collector: examples: ["process"]
+				open_files_limit: {
+					description: "The maximum number of file descriptors the process is allowed to open (from /proc/pid/limits)."
+					required:    false
+					examples: ["1024", "65536"]
+				}
+			}
+		}
+
+		// Host process — Linux-specific
+		process_task_count: _host & {
+			description: "The number of threads (tasks) in the process."
+			type:        "gauge"
+			relevant_when: "OS is Linux"
+			tags: _process_identity_tags & {
+				collector: examples: ["process"]
+				thread_ids: {
+					description: "The thread IDs belonging to the process (multi-value tag)."
+					required:    false
+					examples: ["12345"]
+				}
+			}
+		}
+		process_minor_page_faults: _host & _process_memory_gauge & _process_linux & {
+			description: "The number of minor page faults (no disk I/O required) for the process."
+		}
+		process_major_page_faults: _host & _process_memory_gauge & _process_linux & {
+			description: "The number of major page faults (required disk I/O) for the process."
+		}
+		process_voluntary_context_switches: _host & _process_gauge & _process_linux & {
+			description: "The number of voluntary context switches by the process."
+		}
+		process_involuntary_context_switches: _host & _process_gauge & _process_linux & {
+			description: "The number of involuntary context switches by the process."
+		}
 
 		// Host cgroups
 		cgroup_cpu_usage_seconds_total: _host & _cgroup_cpu & {description: "The total amount CPU time used by this cgroup and its descendants, in seconds."}
@@ -283,18 +331,126 @@ components: sources: host_metrics: {
 			}
 		}
 		_network_nomac: _network_counter & {relevant_when: "OS is not macOS"}
-		_process_counter: {
-			type: "counter"
-			tags: _host_metrics_tags & {
-				collector: examples: ["process"]
+		_process_identity_tags: {
+			pid: {
+				description: "The process ID."
+				required:    true
+				examples: ["1234"]
+			}
+			name: {
+				description: "The process name."
+				required:    true
+				examples: ["vector", "sshd"]
+			}
+			command: {
+				description: "The full command line of the process."
+				required:    true
+				examples: ["vector --config /etc/vector/vector.toml"]
+			}
+			ppid: {
+				description: "The parent process ID."
+				required:    false
+				examples: ["1"]
+			}
+			user: {
+				description: "The username of the process owner (resolved via NSS/SSSD, Unix only)."
+				required:    false
+				examples: ["root", "vector"]
+			}
+			effective_user: {
+				description: "The effective username of the process (Unix only)."
+				required:    false
+				examples: ["root", "nobody"]
+			}
+			group_id: {
+				description: "The primary group ID of the process."
+				required:    false
+				examples: ["0", "1000"]
+			}
+			effective_group_id: {
+				description: "The effective group ID of the process."
+				required:    false
+				examples: ["0", "1000"]
+			}
+			session_id: {
+				description: "The session ID of the process."
+				required:    false
+				examples: ["1234"]
+			}
+			status: {
+				description: "The current status of the process."
+				required:    true
+				examples: ["run", "sleep", "idle", "zombie", "stop", "dead"]
+			}
+			exe: {
+				description: "The full path to the process executable (Unix only)."
+				required:    false
+				examples: ["/usr/bin/vector"]
+			}
+			thread_kind: {
+				description: "Whether the process is a kernel or userland thread (Linux only)."
+				required:    false
+				examples: ["kernel", "userland"]
+			}
+		}
+		_process_io_extra_tags: {
+			cwd: {
+				description: "The current working directory of the process (Unix only)."
+				required:    false
+				examples: ["/home/vector"]
+			}
+			root: {
+				description: "The root directory of the process (Unix only)."
+				required:    false
+				examples: ["/"]
 			}
 		}
 		_process_gauge: {
 			type: "gauge"
-			tags: _host_metrics_tags & {
+			tags: _process_identity_tags & {
 				collector: examples: ["process"]
 			}
 		}
+		_process_cpu_gauge: {
+			type: "gauge"
+			tags: _process_identity_tags & {
+				collector: examples: ["process"]
+				nice: {
+					description: "The nice value (scheduling priority) of the process (Linux only)."
+					required:    false
+					examples: ["0", "-20", "19"]
+				}
+			}
+		}
+		_process_runtime_counter: {
+			type: "counter"
+			tags: _process_identity_tags & {
+				collector: examples: ["process"]
+				start_time: {
+					description: "The UNIX timestamp when the process started."
+					required:    false
+					examples: ["1700000000"]
+				}
+			}
+		}
+		_process_memory_gauge: {
+			type: "gauge"
+			tags: _process_identity_tags & {
+				collector: examples: ["process"]
+				shm_owner_pid: {
+					description: "The PID of the process that owns the shared memory segment used by this process (Linux only)."
+					required:    false
+					examples: ["5678"]
+				}
+			}
+		}
+		_process_io_gauge: {
+			type: "gauge"
+			tags: _process_identity_tags & _process_io_extra_tags & {
+				collector: examples: ["process"]
+			}
+		}
+		_process_linux: {relevant_when: "OS is Linux"}
 
 		_tcp_linux: {relevant_when: "OS is Linux"}
 		_tcp_gauge: {

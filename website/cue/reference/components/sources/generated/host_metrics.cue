@@ -296,37 +296,90 @@ generated: components: sources: host_metrics: configuration: {
 	process: {
 		description: "Options for the process metrics collector."
 		required:    false
-		type: object: options: processes: {
-			description: "Lists of process name patterns to include or exclude."
-			required:    false
-			type: object: {
-				examples: [{
-					excludes: null
-					includes: ["docker"]
-				}]
-				options: {
-					excludes: {
-						description: """
+		type: object: options: {
+			metrics: {
+				description: """
+					Lists of metric name patterns to include or exclude.
+
+					When not set, all process metrics are emitted. Supports glob patterns.
+					Metric names: `process_cpu_usage`, `process_memory_usage`,
+					`process_memory_virtual_usage`, `process_runtime`,
+					`process_accumulated_cpu_time`, `process_disk_read_bytes`,
+					`process_disk_written_bytes`, `process_total_disk_read_bytes`,
+					`process_total_disk_written_bytes`, `process_open_files`,
+					`process_task_count` (Linux), `process_minor_page_faults` (Linux),
+					`process_major_page_faults` (Linux),
+					`process_voluntary_context_switches` (Linux),
+					`process_involuntary_context_switches` (Linux).
+					"""
+				required: false
+				type: object: {
+					examples: ["process_cpu_*", "process_memory_*", "process_disk_*"]
+					options: {
+						excludes: {
+							description: """
 																Any patterns which should be excluded.
 
 																The patterns are matched using globbing.
 																"""
-						required: false
-						type: array: items: type: string: {}
-					}
-					includes: {
-						description: """
+							required: false
+							type: array: items: type: string: {}
+						}
+						includes: {
+							description: """
 																Any patterns which should be included.
 
 																The patterns are matched using globbing.
 																"""
-						required: false
-						type: array: {
-							default: ["*"]
-							items: type: string: {}
+							required: false
+							type: array: items: type: string: {}
 						}
 					}
 				}
+			}
+			processes: {
+				description: "Lists of process name patterns to include or exclude."
+				required:    false
+				type: object: {
+					examples: [{
+						excludes: null
+						includes: ["docker"]
+					}]
+					options: {
+						excludes: {
+							description: """
+																Any patterns which should be excluded.
+
+																The patterns are matched using globbing.
+																"""
+							required: false
+							type: array: items: type: string: {}
+						}
+						includes: {
+							description: """
+																Any patterns which should be included.
+
+																The patterns are matched using globbing.
+																"""
+							required: false
+							type: array: {
+								default: ["*"]
+								items: type: string: {}
+							}
+						}
+					}
+				}
+			}
+			uid_cache_ttl_secs: {
+				description: """
+					TTL (in seconds) for the UID-to-username cache.
+
+					Usernames are resolved via NSS/SSSD which may hit LDAP in IDM/IPA
+					environments. This cache avoids repeated lookups. Set to `0` to disable
+					caching. Defaults to 300 seconds (5 minutes).
+					"""
+				required: false
+				type: uint: default: 0
 			}
 		}
 	}

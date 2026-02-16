@@ -17,29 +17,53 @@ pub struct ProcessConfig {
     #[configurable(metadata(docs::examples = "example_processes()"))]
     processes: FilterList,
 
-    /// When enabled, adds extended identity tags and additional metrics to process metrics.
+    /// Lists of metric name patterns to include or exclude.
     ///
-    /// Extended tags include: `ppid`, `user`, `effective_user`, `group_id`,
-    /// `effective_group_id`, `session_id`, `status`, `exe`, and more.
-    /// Additional metrics include disk I/O, open files, accumulated CPU time,
-    /// context switches (Linux), and page faults (Linux).
+    /// When not set, all process metrics are emitted. Supports glob patterns.
+    /// Metric names: `process_cpu_usage`, `process_memory_usage`,
+    /// `process_memory_virtual_usage`, `process_runtime`,
+    /// `process_accumulated_cpu_time`, `process_disk_read_bytes`,
+    /// `process_disk_written_bytes`, `process_total_disk_read_bytes`,
+    /// `process_total_disk_written_bytes`, `process_open_files`,
+    /// `process_task_count` (Linux), `process_minor_page_faults` (Linux),
+    /// `process_major_page_faults` (Linux),
+    /// `process_voluntary_context_switches` (Linux),
+    /// `process_involuntary_context_switches` (Linux).
     #[serde(default)]
-    pub extended_identity_tags: bool,
+    #[configurable(metadata(docs::examples = "example_process_metrics()"))]
+    pub(super) metrics: FilterList,
+
+    /// TTL (in seconds) for the UID-to-username cache.
+    ///
+    /// Usernames are resolved via NSS/SSSD which may hit LDAP in IDM/IPA
+    /// environments. This cache avoids repeated lookups. Set to `0` to disable
+    /// caching. Defaults to 300 seconds (5 minutes).
+    #[serde(default = "default_uid_cache_ttl_secs")]
+    pub(super) uid_cache_ttl_secs: u64,
+}
+
+const fn default_uid_cache_ttl_secs() -> u64 {
+    300
+}
+
+fn example_process_metrics() -> Vec<String> {
+    vec![
+        "process_cpu_*".into(),
+        "process_memory_*".into(),
+        "process_disk_*".into(),
+    ]
 }
 
 const RUNTIME: &str = "process_runtime";
 const CPU_USAGE: &str = "process_cpu_usage";
 const MEMORY_USAGE: &str = "process_memory_usage";
 const MEMORY_VIRTUAL_USAGE: &str = "process_memory_virtual_usage";
-
-// Extended metric names
 const ACCUMULATED_CPU_TIME: &str = "process_accumulated_cpu_time";
 const DISK_READ_BYTES: &str = "process_disk_read_bytes";
 const DISK_WRITTEN_BYTES: &str = "process_disk_written_bytes";
 const TOTAL_DISK_READ_BYTES: &str = "process_total_disk_read_bytes";
 const TOTAL_DISK_WRITTEN_BYTES: &str = "process_total_disk_written_bytes";
 const OPEN_FILES: &str = "process_open_files";
-const OPEN_FILES_LIMIT: &str = "process_open_files_limit";
 #[cfg(target_os = "linux")]
 const TASK_COUNT: &str = "process_task_count";
 #[cfg(target_os = "linux")]
@@ -69,37 +93,75 @@ fn format_process_status(status: sysinfo::ProcessStatus) -> &'static str {
     }
 }
 
-/// Helper to format an optional Path as a tag value string.
 #[cfg(unix)]
 fn path_tag(p: Option<&Path>) -> String {
     p.map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_default()
 }
 
-/// Find the creator PID of any SysV shared memory segment mapped by this process.
-/// Returns the first shm creator PID found, or None if no SysV shm is mapped.
+/// Shared memory segment info loaded from /proc/sysvipc/shm.
 #[cfg(target_os = "linux")]
-fn find_shm_owner_pid(maps: &procfs::process::MemoryMaps) -> Option<i32> {
-    use procfs::Current;
-    use std::sync::OnceLock;
-    // Cache the SysV shm segments for the duration of this scrape.
-    // OnceLock ensures we read /proc/sysvipc/shm at most once per process lifetime,
-    // but since this is called many times per scrape we use a simple static cache.
-    // For true per-scrape caching, a field on HostMetrics would be better,
-    // but this is a reasonable starting point.
-    static SHM_SEGMENTS: OnceLock<Option<Vec<(i32, i32)>>> = OnceLock::new();
-    let segments = SHM_SEGMENTS.get_or_init(|| {
-        procfs::SharedMemorySegments::current().ok().map(|shm| {
-            shm.0.iter().map(|s| (s.key, s.cpid)).collect()
-        })
-    });
+struct ShmInfo {
+    /// (key, creator_pid) pairs for all active segments.
+    segments: Vec<(i32, i32)>,
+    /// Set of PIDs that created at least one SHM segment.
+    creator_pids: std::collections::HashSet<i32>,
+}
 
-    for map in &maps.0 {
-        if let procfs::process::MMapPath::Vsys(key) = &map.pathname {
-            if let Some(segs) = segments {
-                for (seg_key, cpid) in segs {
-                    if seg_key == key {
-                        return Some(*cpid);
+/// Load the current SysV shared memory segments from /proc/sysvipc/shm.
+#[cfg(target_os = "linux")]
+fn load_shm_info() -> ShmInfo {
+    use procfs::Current;
+    match procfs::SharedMemorySegments::current() {
+        Ok(shm) => {
+            let segments: Vec<(i32, i32)> = shm.0.iter().map(|s| (s.key, s.cpid)).collect();
+            let creator_pids = segments.iter().map(|&(_, cpid)| cpid).collect();
+            ShmInfo {
+                segments,
+                creator_pids,
+            }
+        }
+        Err(_) => ShmInfo {
+            segments: Vec::new(),
+            creator_pids: std::collections::HashSet::new(),
+        },
+    }
+}
+
+/// Find the creator PID of a SysV shared memory segment used by a process.
+///
+/// Strategy (cheapest first):
+/// 1. If this process's PID is itself a SHM creator, return its own PID.
+/// 2. If /proc/pid/status shows RssShmem > 0, read /proc/pid/maps to find
+///    which segment key is mapped and return that segment's creator PID.
+/// 3. Otherwise return None (no maps read needed).
+#[cfg(target_os = "linux")]
+fn resolve_shm_owner(
+    pid_i32: i32,
+    proc_status: Option<&procfs::process::Status>,
+    proc_handle: &procfs::process::Process,
+    shm_info: &ShmInfo,
+) -> Option<i32> {
+    // Fast path: this process created a SHM segment
+    if shm_info.creator_pids.contains(&pid_i32) {
+        return Some(pid_i32);
+    }
+
+    // Only read maps if the process actually uses shared memory
+    let has_shm = proc_status
+        .and_then(|s| s.rssshmem)
+        .map_or(false, |v| v > 0);
+    if !has_shm {
+        return None;
+    }
+
+    // Slow path: scan maps to find which SHM key is mapped
+    if let Ok(maps) = proc_handle.maps() {
+        for map in &maps.0 {
+            if let procfs::process::MMapPath::Vsys(key) = &map.pathname {
+                for &(seg_key, cpid) in &shm_info.segments {
+                    if seg_key == *key {
+                        return Some(cpid);
                     }
                 }
             }
@@ -110,20 +172,18 @@ fn find_shm_owner_pid(maps: &procfs::process::MemoryMaps) -> Option<i32> {
 
 impl HostMetrics {
     pub async fn process_metrics(&mut self, output: &mut super::MetricsBuffer) {
-        let extended = self.config.process.extended_identity_tags;
-        let mut refresh_kind = ProcessRefreshKind::default()
+        let metric_filter = &self.config.process.metrics;
+        let emit = |name: &str| metric_filter.contains_str(Some(name));
+
+        let refresh_kind = ProcessRefreshKind::default()
             .with_memory()
             .with_cpu()
-            .with_cmd(UpdateKind::OnlyIfNotSet);
-
-        if extended {
-            refresh_kind = refresh_kind
-                .with_user(UpdateKind::OnlyIfNotSet)
-                .with_exe(UpdateKind::OnlyIfNotSet)
-                .with_root(UpdateKind::OnlyIfNotSet)
-                .with_cwd(UpdateKind::OnlyIfNotSet)
-                .with_disk_usage();
-        }
+            .with_cmd(UpdateKind::OnlyIfNotSet)
+            .with_disk_usage()
+            .with_user(UpdateKind::OnlyIfNotSet)
+            .with_exe(UpdateKind::OnlyIfNotSet)
+            .with_root(UpdateKind::OnlyIfNotSet)
+            .with_cwd(UpdateKind::OnlyIfNotSet);
 
         self.system.refresh_processes_specifics(
             ProcessesToUpdate::All,
@@ -131,6 +191,8 @@ impl HostMetrics {
             refresh_kind,
         );
         output.name = "process";
+        #[cfg(target_os = "linux")]
+        let shm_info = load_shm_info();
         let sep = OsStr::new(" ");
         for (pid, process) in self.system.processes().iter().filter(|&(_, proc)| {
             self.config
@@ -142,30 +204,13 @@ impl HostMetrics {
             let name = process.name().to_str().unwrap_or("unknown").to_string();
             let command = process.cmd().join(sep).to_str().unwrap_or("").to_string();
 
-            // Base tags — always present on all metrics.
-            let base_tags = || {
-                metric_tags!(
-                    "pid" => pid_str.clone(),
-                    "name" => name.clone(),
-                    "command" => command.clone()
-                )
-            };
+            // --- Identity tags (on all metrics) ---
+            let mut identity = metric_tags!(
+                "pid" => pid_str.clone(),
+                "name" => name.clone(),
+                "command" => command.clone()
+            );
 
-            if !extended {
-                // Original behavior: base tags only, 4 metrics.
-                output.gauge(CPU_USAGE, process.cpu_usage().into(), base_tags());
-                output.gauge(MEMORY_USAGE, process.memory() as f64, base_tags());
-                output.gauge(
-                    MEMORY_VIRTUAL_USAGE,
-                    process.virtual_memory() as f64,
-                    base_tags(),
-                );
-                output.counter(RUNTIME, process.run_time() as f64, base_tags());
-                continue;
-            }
-
-            // --- Extended identity tags ---
-            let mut identity = base_tags();
             if let Some(ppid) = process.parent() {
                 identity.replace("ppid".into(), ppid.as_u32().to_string());
             }
@@ -194,10 +239,7 @@ impl HostMetrics {
                 identity.replace("session_id".into(), sid.as_u32().to_string());
             }
 
-            identity.replace(
-                "status".into(),
-                format_process_status(process.status()),
-            );
+            identity.replace("status".into(), format_process_status(process.status()));
 
             #[cfg(unix)]
             {
@@ -217,39 +259,39 @@ impl HostMetrics {
             }
 
             // --- Read procfs data upfront (Linux only) ---
-            // We read stat + status once per process to get nice, page faults,
-            // context switches, and shared memory info.
             #[cfg(target_os = "linux")]
             let procfs_data = {
                 let pid_i32 = pid.as_u32() as i32;
                 procfs::process::Process::new(pid_i32).ok().map(|p| {
                     let stat = p.stat().ok();
                     let status = p.status().ok();
-                    let has_shm = process.memory() > 0;
-                    let shm_owner_pid = if has_shm {
-                        p.maps().ok().and_then(|maps| {
-                            find_shm_owner_pid(&maps)
-                        })
-                    } else {
-                        None
-                    };
+                    let shm_owner_pid =
+                        resolve_shm_owner(pid_i32, status.as_ref(), &p, &shm_info);
                     (stat, status, shm_owner_pid)
                 })
             };
 
-            // --- Time tags (identity + start_time + nice) for CPU/runtime metrics ---
-            let time_tags = {
+            // --- Runtime tags (identity + start_time) for process_runtime only ---
+            let runtime_tags = {
                 let mut t = identity.clone();
                 let start = process.start_time();
                 if start > 0 {
                     t.replace("start_time".into(), start.to_string());
                 }
-                #[cfg(target_os = "linux")]
+                t
+            };
+
+            // --- CPU tags (identity + nice) for CPU metrics only ---
+            #[cfg(target_os = "linux")]
+            let cpu_tags = {
+                let mut t = identity.clone();
                 if let Some((Some(ref stat), _, _)) = procfs_data {
                     t.replace("nice".into(), stat.nice.to_string());
                 }
                 t
             };
+            #[cfg(not(target_os = "linux"))]
+            let cpu_tags = identity.clone();
 
             // --- Memory tags (identity + shm_owner_pid) ---
             #[cfg(target_os = "linux")]
@@ -263,7 +305,7 @@ impl HostMetrics {
             #[cfg(not(target_os = "linux"))]
             let memory_tags = identity.clone();
 
-            // --- Filesystem tags (identity + cwd, root) for I/O metrics ---
+            // --- Filesystem tags (identity + cwd, root) for I/O ---
             #[cfg(unix)]
             let io_tags = {
                 let mut t = identity.clone();
@@ -280,87 +322,80 @@ impl HostMetrics {
             #[cfg(not(unix))]
             let io_tags = identity.clone();
 
-            // --- Emit base metrics with extended tags ---
-            output.gauge(CPU_USAGE, process.cpu_usage().into(), time_tags.clone());
-            output.gauge(MEMORY_USAGE, process.memory() as f64, memory_tags.clone());
-            output.gauge(
-                MEMORY_VIRTUAL_USAGE,
-                process.virtual_memory() as f64,
-                memory_tags.clone(),
-            );
-            output.counter(RUNTIME, process.run_time() as f64, time_tags.clone());
+            // --- Emit metrics (filtered by config) ---
+            if emit(CPU_USAGE) {
+                output.gauge(CPU_USAGE, process.cpu_usage().into(), cpu_tags);
+            }
+            if emit(MEMORY_USAGE) {
+                output.gauge(MEMORY_USAGE, process.memory() as f64, memory_tags.clone());
+            }
+            if emit(MEMORY_VIRTUAL_USAGE) {
+                output.gauge(MEMORY_VIRTUAL_USAGE, process.virtual_memory() as f64, memory_tags.clone());
+            }
+            if emit(RUNTIME) {
+                output.counter(RUNTIME, process.run_time() as f64, runtime_tags);
+            }
+            if emit(ACCUMULATED_CPU_TIME) {
+                output.gauge(ACCUMULATED_CPU_TIME, process.accumulated_cpu_time() as f64, identity.clone());
+            }
 
-            // --- Extended resource metrics ---
-            output.gauge(
-                ACCUMULATED_CPU_TIME,
-                process.accumulated_cpu_time() as f64,
-                time_tags,
-            );
-
-            // --- Disk I/O metrics ---
             let du = process.disk_usage();
-            output.gauge(DISK_READ_BYTES, du.read_bytes as f64, io_tags.clone());
-            output.gauge(DISK_WRITTEN_BYTES, du.written_bytes as f64, io_tags.clone());
-            output.gauge(
-                TOTAL_DISK_READ_BYTES,
-                du.total_read_bytes as f64,
-                io_tags.clone(),
-            );
-            output.gauge(
-                TOTAL_DISK_WRITTEN_BYTES,
-                du.total_written_bytes as f64,
-                io_tags.clone(),
-            );
-
-            // --- Open files metrics ---
-            if let Some(open) = process.open_files() {
-                output.gauge(OPEN_FILES, open as f64, io_tags.clone());
+            if emit(DISK_READ_BYTES) {
+                output.gauge(DISK_READ_BYTES, du.read_bytes as f64, io_tags.clone());
             }
-            if let Some(limit) = process.open_files_limit() {
-                output.gauge(OPEN_FILES_LIMIT, limit as f64, io_tags);
+            if emit(DISK_WRITTEN_BYTES) {
+                output.gauge(DISK_WRITTEN_BYTES, du.written_bytes as f64, io_tags.clone());
+            }
+            if emit(TOTAL_DISK_READ_BYTES) {
+                output.gauge(TOTAL_DISK_READ_BYTES, du.total_read_bytes as f64, io_tags.clone());
+            }
+            if emit(TOTAL_DISK_WRITTEN_BYTES) {
+                output.gauge(TOTAL_DISK_WRITTEN_BYTES, du.total_written_bytes as f64, io_tags.clone());
             }
 
-            // --- Task count (Linux only) ---
-            #[cfg(target_os = "linux")]
-            if let Some(tasks) = process.tasks() {
-                let mut task_tags = identity.clone();
-                let thread_ids: Vec<String> =
-                    tasks.iter().map(|t| t.as_u32().to_string()).collect();
-                for tid in &thread_ids {
-                    task_tags.insert("thread_ids".into(), tid.clone());
+            if emit(OPEN_FILES) {
+                if let Some(open) = process.open_files() {
+                    let mut open_tags = io_tags.clone();
+                    if let Some(limit) = process.open_files_limit() {
+                        open_tags.replace("open_files_limit".into(), limit.to_string());
+                    }
+                    output.gauge(OPEN_FILES, open as f64, open_tags);
                 }
-                output.gauge(TASK_COUNT, tasks.len() as f64, task_tags);
             }
 
-            // --- Linux procfs-based metrics (page faults, context switches) ---
+            #[cfg(target_os = "linux")]
+            if emit(TASK_COUNT) {
+                if let Some(tasks) = process.tasks() {
+                    let mut task_tags = identity.clone();
+                    let thread_ids: Vec<String> =
+                        tasks.iter().map(|t| t.as_u32().to_string()).collect();
+                    for tid in &thread_ids {
+                        task_tags.insert("thread_ids".into(), tid.clone());
+                    }
+                    output.gauge(TASK_COUNT, tasks.len() as f64, task_tags);
+                }
+            }
+
             #[cfg(target_os = "linux")]
             if let Some((stat_opt, status_opt, _)) = procfs_data {
                 if let Some(stat) = stat_opt {
-                    output.gauge(
-                        MINOR_PAGE_FAULTS,
-                        stat.minflt as f64,
-                        memory_tags.clone(),
-                    );
-                    output.gauge(
-                        MAJOR_PAGE_FAULTS,
-                        stat.majflt as f64,
-                        memory_tags,
-                    );
+                    if emit(MINOR_PAGE_FAULTS) {
+                        output.gauge(MINOR_PAGE_FAULTS, stat.minflt as f64, memory_tags.clone());
+                    }
+                    if emit(MAJOR_PAGE_FAULTS) {
+                        output.gauge(MAJOR_PAGE_FAULTS, stat.majflt as f64, memory_tags);
+                    }
                 }
                 if let Some(status) = status_opt {
-                    if let Some(vol) = status.voluntary_ctxt_switches {
-                        output.gauge(
-                            VOLUNTARY_CONTEXT_SWITCHES,
-                            vol as f64,
-                            identity.clone(),
-                        );
+                    if emit(VOLUNTARY_CONTEXT_SWITCHES) {
+                        if let Some(vol) = status.voluntary_ctxt_switches {
+                            output.gauge(VOLUNTARY_CONTEXT_SWITCHES, vol as f64, identity.clone());
+                        }
                     }
-                    if let Some(nonvol) = status.nonvoluntary_ctxt_switches {
-                        output.gauge(
-                            INVOLUNTARY_CONTEXT_SWITCHES,
-                            nonvol as f64,
-                            identity.clone(),
-                        );
+                    if emit(INVOLUNTARY_CONTEXT_SWITCHES) {
+                        if let Some(nonvol) = status.nonvoluntary_ctxt_switches {
+                            output.gauge(INVOLUNTARY_CONTEXT_SWITCHES, nonvol as f64, identity.clone());
+                        }
                     }
                 }
             }
@@ -372,91 +407,268 @@ impl HostMetrics {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{HostMetrics, HostMetricsConfig, MetricsBuffer};
-    use crate::sources::host_metrics::tests::count_tag;
+    use super::super::{FilterList, HostMetrics, HostMetricsConfig, MetricsBuffer, PatternWrapper};
+    use super::*;
+    use crate::sources::host_metrics::tests::{count_name, count_tag};
 
-    #[tokio::test]
-    async fn generates_process_metrics() {
-        let mut buffer = MetricsBuffer::new(None);
-        HostMetrics::new(HostMetricsConfig::default())
-            .process_metrics(&mut buffer)
-            .await;
-        let metrics = buffer.metrics;
-        assert!(!metrics.is_empty());
-
-        // All metrics are named process_*
-        assert!(
-            !metrics
-                .iter()
-                .any(|metric| !metric.name().starts_with("process_"))
-        );
-
-        // They should all have the required tag
-        assert_eq!(count_tag(&metrics, "pid"), metrics.len());
-        assert_eq!(count_tag(&metrics, "name"), metrics.len());
-        assert_eq!(count_tag(&metrics, "command"), metrics.len());
-    }
-
-    #[tokio::test]
-    async fn generates_extended_process_metrics() {
-        let mut config = HostMetricsConfig::default();
-        config.process.extended_identity_tags = true;
+    async fn get_metrics(config: HostMetricsConfig) -> Vec<vector_lib::event::Metric> {
         let mut buffer = MetricsBuffer::new(None);
         HostMetrics::new(config)
             .process_metrics(&mut buffer)
             .await;
-        let metrics = buffer.metrics;
-        assert!(!metrics.is_empty());
+        buffer.metrics
+    }
 
-        // All metrics are named process_*
+    async fn get_default_metrics() -> Vec<vector_lib::event::Metric> {
+        get_metrics(HostMetricsConfig::default()).await
+    }
+
+    // --- Basic metric generation ---
+
+    #[tokio::test]
+    async fn generates_all_process_metrics() {
+        let metrics = get_default_metrics().await;
+        assert!(!metrics.is_empty());
         assert!(metrics.iter().all(|m| m.name().starts_with("process_")));
 
-        // Base tags on all metrics
+        let names: std::collections::HashSet<&str> =
+            metrics.iter().map(|m| m.name()).collect();
+
+        // Core metrics
+        assert!(names.contains(CPU_USAGE));
+        assert!(names.contains(MEMORY_USAGE));
+        assert!(names.contains(MEMORY_VIRTUAL_USAGE));
+        assert!(names.contains(RUNTIME));
+        assert!(names.contains(ACCUMULATED_CPU_TIME));
+
+        // Disk I/O
+        assert!(names.contains(DISK_READ_BYTES));
+        assert!(names.contains(DISK_WRITTEN_BYTES));
+        assert!(names.contains(TOTAL_DISK_READ_BYTES));
+        assert!(names.contains(TOTAL_DISK_WRITTEN_BYTES));
+    }
+
+    // --- Identity tags on all metrics ---
+
+    #[tokio::test]
+    async fn all_metrics_have_base_identity_tags() {
+        let metrics = get_default_metrics().await;
+        assert!(!metrics.is_empty());
+
         assert_eq!(count_tag(&metrics, "pid"), metrics.len());
         assert_eq!(count_tag(&metrics, "name"), metrics.len());
-
-        // Should have extended metrics beyond the original 4 per process
-        let metric_names: std::collections::HashSet<&str> =
-            metrics.iter().map(|m| m.name()).collect();
-        assert!(metric_names.contains("process_accumulated_cpu_time"));
-        assert!(metric_names.contains("process_disk_read_bytes"));
-        assert!(metric_names.contains("process_disk_written_bytes"));
-
-        // Extended identity tags should be present on at least some metrics
+        assert_eq!(count_tag(&metrics, "command"), metrics.len());
         assert!(count_tag(&metrics, "status") > 0);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unix_identity_tags_present() {
+        let metrics = get_default_metrics().await;
+        assert!(!metrics.is_empty());
+
+        // user tag should be on at least some metrics (UID 0 → root always exists)
+        assert!(count_tag(&metrics, "user") > 0);
+    }
+
+    // --- Tag placement per metric category ---
+
+    #[tokio::test]
+    async fn start_time_only_on_runtime() {
+        let metrics = get_default_metrics().await;
+
+        let runtime_metrics: Vec<_> = metrics.iter().filter(|m| m.name() == RUNTIME).collect();
+        let non_runtime: Vec<_> = metrics.iter().filter(|m| m.name() != RUNTIME).collect();
+
+        // start_time should be on runtime metrics
+        assert!(runtime_metrics.iter().any(|m| {
+            m.tags().map(|t| t.contains_key("start_time")).unwrap_or(false)
+        }));
+
+        // start_time should NOT be on any other metric
+        assert!(non_runtime.iter().all(|m| {
+            !m.tags().map(|t| t.contains_key("start_time")).unwrap_or(false)
+        }));
     }
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn generates_linux_procfs_metrics() {
-        let mut config = HostMetricsConfig::default();
-        config.process.extended_identity_tags = true;
-        let mut buffer = MetricsBuffer::new(None);
-        HostMetrics::new(config)
-            .process_metrics(&mut buffer)
-            .await;
-        let metrics = buffer.metrics;
+    async fn nice_only_on_cpu_usage() {
+        let metrics = get_default_metrics().await;
 
-        let metric_names: std::collections::HashSet<&str> =
+        let cpu_metrics: Vec<_> = metrics.iter().filter(|m| m.name() == CPU_USAGE).collect();
+        let non_cpu: Vec<_> = metrics.iter().filter(|m| m.name() != CPU_USAGE).collect();
+
+        assert!(!cpu_metrics.is_empty());
+        assert!(cpu_metrics.iter().any(|m| {
+            m.tags().map(|t| t.contains_key("nice")).unwrap_or(false)
+        }));
+
+        // nice should NOT be on any other metric
+        assert!(non_cpu.iter().all(|m| {
+            !m.tags().map(|t| t.contains_key("nice")).unwrap_or(false)
+        }));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn filesystem_tags_on_io_metrics() {
+        let metrics = get_default_metrics().await;
+
+        let io_names = [
+            DISK_READ_BYTES, DISK_WRITTEN_BYTES,
+            TOTAL_DISK_READ_BYTES, TOTAL_DISK_WRITTEN_BYTES,
+            OPEN_FILES,
+        ];
+        let io_metrics: Vec<_> = metrics
+            .iter()
+            .filter(|m| io_names.contains(&m.name()))
+            .collect();
+
+        if !io_metrics.is_empty() {
+            // At least some I/O metrics should have cwd/root
+            let has_cwd = io_metrics.iter().any(|m| {
+                m.tags().map(|t| t.contains_key("cwd")).unwrap_or(false)
+            });
+            // cwd may be empty for some processes, so just check it doesn't
+            // appear on non-I/O metrics
+            let non_io: Vec<_> = metrics
+                .iter()
+                .filter(|m| !io_names.contains(&m.name()))
+                .collect();
+            let cwd_on_non_io = non_io.iter().any(|m| {
+                m.tags().map(|t| t.contains_key("cwd")).unwrap_or(false)
+            });
+            // cwd should NOT appear outside I/O metrics
+            assert!(!cwd_on_non_io, "cwd tag found on non-I/O metric");
+            let _ = has_cwd; // used for documentation, may be false
+        }
+    }
+
+    #[tokio::test]
+    async fn open_files_has_limit_tag() {
+        let metrics = get_default_metrics().await;
+
+        let open_files: Vec<_> = metrics
+            .iter()
+            .filter(|m| m.name() == OPEN_FILES)
+            .collect();
+
+        // open_files_limit should be a tag on open_files, not a separate metric
+        assert_eq!(count_name(&metrics, "process_open_files_limit"), 0);
+        if !open_files.is_empty() {
+            assert!(open_files.iter().any(|m| {
+                m.tags()
+                    .map(|t| t.contains_key("open_files_limit"))
+                    .unwrap_or(false)
+            }));
+        }
+    }
+
+    // --- Metric value types ---
+
+    #[tokio::test]
+    async fn runtime_is_counter_others_are_gauges() {
+        let metrics = get_default_metrics().await;
+
+        for m in &metrics {
+            if m.name() == RUNTIME {
+                assert!(
+                    matches!(m.value(), &vector_lib::event::MetricValue::Counter { .. }),
+                    "process_runtime should be a counter"
+                );
+            } else {
+                assert!(
+                    matches!(m.value(), &vector_lib::event::MetricValue::Gauge { .. }),
+                    "{} should be a gauge",
+                    m.name()
+                );
+            }
+        }
+    }
+
+    // --- Linux-specific metrics ---
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn generates_linux_procfs_metrics() {
+        let metrics = get_default_metrics().await;
+
+        let names: std::collections::HashSet<&str> =
             metrics.iter().map(|m| m.name()).collect();
 
-        // procfs-based metrics should be present
-        assert!(metric_names.contains("process_minor_page_faults"));
-        assert!(metric_names.contains("process_major_page_faults"));
-        assert!(metric_names.contains("process_voluntary_context_switches"));
-        assert!(metric_names.contains("process_involuntary_context_switches"));
+        assert!(names.contains(MINOR_PAGE_FAULTS));
+        assert!(names.contains(MAJOR_PAGE_FAULTS));
+        assert!(names.contains(VOLUNTARY_CONTEXT_SWITCHES));
+        assert!(names.contains(INVOLUNTARY_CONTEXT_SWITCHES));
+    }
 
-        // nice tag should be on CPU metrics
-        let cpu_metrics: Vec<_> = metrics
-            .iter()
-            .filter(|m| m.name() == "process_cpu_usage")
-            .collect();
-        assert!(!cpu_metrics.is_empty());
-        // At least one CPU metric should have the nice tag
-        assert!(cpu_metrics.iter().any(|m| {
-            m.tags()
-                .map(|t| t.contains_key("nice"))
-                .unwrap_or(false)
-        }));
+    // --- Metric name filtering ---
+
+    #[tokio::test]
+    async fn filters_metrics_by_include() {
+        let mut config = HostMetricsConfig::default();
+        config.process.metrics = FilterList {
+            includes: Some(vec![
+                PatternWrapper::try_from("process_cpu_*".to_string()).unwrap(),
+            ]),
+            excludes: None,
+        };
+        let metrics = get_metrics(config).await;
+
+        assert!(!metrics.is_empty());
+        // Only cpu metrics should be present
+        assert!(metrics.iter().all(|m| m.name().starts_with("process_cpu")));
+    }
+
+    #[tokio::test]
+    async fn filters_metrics_by_exclude() {
+        let mut config = HostMetricsConfig::default();
+        config.process.metrics = FilterList {
+            includes: None,
+            excludes: Some(vec![
+                PatternWrapper::try_from("process_disk_*".to_string()).unwrap(),
+                PatternWrapper::try_from("process_total_*".to_string()).unwrap(),
+            ]),
+        };
+        let metrics = get_metrics(config).await;
+
+        assert!(!metrics.is_empty());
+        // No disk metrics should be present
+        assert!(!metrics.iter().any(|m| m.name().starts_with("process_disk")));
+        assert!(!metrics.iter().any(|m| m.name().starts_with("process_total")));
+        // But other metrics should still be there
+        assert!(metrics.iter().any(|m| m.name() == CPU_USAGE));
+    }
+
+    #[tokio::test]
+    async fn empty_filter_emits_all_metrics() {
+        // An empty (default) FilterList should not filter anything out.
+        // We verify by checking that every known metric name appears.
+        let metrics = get_default_metrics().await;
+        let names: std::collections::HashSet<&str> =
+            metrics.iter().map(|m| m.name()).collect();
+
+        assert!(names.contains(CPU_USAGE));
+        assert!(names.contains(MEMORY_USAGE));
+        assert!(names.contains(MEMORY_VIRTUAL_USAGE));
+        assert!(names.contains(RUNTIME));
+        assert!(names.contains(ACCUMULATED_CPU_TIME));
+    }
+
+    // --- Process name filtering still works ---
+
+    #[tokio::test]
+    async fn filters_processes_by_name() {
+        // Filter to a process name that definitely won't match anything
+        let mut config = HostMetricsConfig::default();
+        config.process.processes = FilterList {
+            includes: Some(vec![
+                PatternWrapper::try_from("nonexistent_process_xyz_12345".to_string()).unwrap(),
+            ]),
+            excludes: None,
+        };
+        let metrics = get_metrics(config).await;
+        assert!(metrics.is_empty());
     }
 }

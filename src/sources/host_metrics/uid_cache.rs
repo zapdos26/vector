@@ -12,6 +12,7 @@ const DEFAULT_TTL: Duration = Duration::from_secs(300);
 pub struct UidCache {
     cache: HashMap<u32, CacheEntry>,
     ttl: Duration,
+    last_eviction: Instant,
 }
 
 struct CacheEntry {
@@ -24,14 +25,31 @@ impl UidCache {
         Self {
             cache: HashMap::new(),
             ttl: DEFAULT_TTL,
+            last_eviction: Instant::now(),
+        }
+    }
+
+    pub fn with_ttl(ttl: Duration) -> Self {
+        Self {
+            cache: HashMap::new(),
+            ttl,
+            last_eviction: Instant::now(),
         }
     }
 
     /// Resolves a UID to a username, using the cache if available.
     /// Falls back to the stringified UID on lookup failure.
+    /// Periodically evicts expired entries to prevent unbounded growth.
     #[cfg(unix)]
     pub fn resolve(&mut self, uid: u32) -> String {
         let now = Instant::now();
+
+        // Evict expired entries once per TTL period
+        if now.duration_since(self.last_eviction) >= self.ttl {
+            self.cache
+                .retain(|_, entry| now.duration_since(entry.inserted_at) < self.ttl);
+            self.last_eviction = now;
+        }
 
         if let Some(entry) = self.cache.get(&uid) {
             if now.duration_since(entry.inserted_at) < self.ttl {
@@ -105,21 +123,84 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_uid_cache_returns_consistent_results() {
+    fn test_uid_cache_resolves_root() {
         let mut cache = UidCache::new();
-        let result1 = cache.resolve(0);
-        let result2 = cache.resolve(0);
-        assert_eq!(result1, result2);
-        // UID 0 should resolve to "root" on Unix
+        let result = cache.resolve(0);
         #[cfg(unix)]
-        assert_eq!(result1, "root");
+        assert_eq!(result, "root");
     }
 
     #[test]
     fn test_uid_cache_unknown_uid_returns_string() {
         let mut cache = UidCache::new();
-        // Very high UID unlikely to exist
         let result = cache.resolve(4_294_967_294);
         assert_eq!(result, "4294967294");
+    }
+
+    #[test]
+    fn test_uid_cache_stores_entry() {
+        let mut cache = UidCache::new();
+        assert!(cache.cache.is_empty());
+        cache.resolve(0);
+        assert_eq!(cache.cache.len(), 1);
+        // Second resolve should reuse the cached entry, not add a new one
+        cache.resolve(0);
+        assert_eq!(cache.cache.len(), 1);
+    }
+
+    #[test]
+    fn test_uid_cache_respects_ttl_expiry() {
+        // A zero-TTL cache means every entry is immediately expired.
+        let mut cache = UidCache::with_ttl(Duration::from_secs(0));
+        cache.resolve(0);
+        let first_inserted = cache.cache.get(&0).unwrap().inserted_at;
+
+        // Small sleep so the next Instant is strictly later
+        std::thread::sleep(Duration::from_millis(5));
+
+        cache.resolve(0);
+        let second_inserted = cache.cache.get(&0).unwrap().inserted_at;
+
+        // With TTL=0 the entry was expired and re-inserted, so the
+        // timestamp must have advanced.
+        assert!(
+            second_inserted > first_inserted,
+            "expired entry should have been re-inserted with a newer timestamp"
+        );
+    }
+
+    #[test]
+    fn test_uid_cache_serves_from_cache_within_ttl() {
+        let mut cache = UidCache::with_ttl(Duration::from_secs(600));
+        cache.resolve(0);
+        let first_inserted = cache.cache.get(&0).unwrap().inserted_at;
+
+        std::thread::sleep(Duration::from_millis(5));
+
+        cache.resolve(0);
+        let second_inserted = cache.cache.get(&0).unwrap().inserted_at;
+
+        // With a long TTL the cached entry should NOT have been replaced.
+        assert_eq!(
+            first_inserted, second_inserted,
+            "cached entry should be reused within TTL"
+        );
+    }
+
+    #[test]
+    fn test_uid_cache_evicts_expired_entries() {
+        let mut cache = UidCache::with_ttl(Duration::from_millis(200));
+        // Populate with two UIDs (within TTL window)
+        cache.resolve(0);
+        cache.resolve(4_294_967_294);
+        assert_eq!(cache.cache.len(), 2);
+
+        // Sleep well past TTL, then resolve a different UID to trigger eviction
+        std::thread::sleep(Duration::from_millis(300));
+        cache.resolve(1);
+
+        // The two old entries should have been evicted; only UID 1 remains
+        assert_eq!(cache.cache.len(), 1);
+        assert!(cache.cache.contains_key(&1));
     }
 }
