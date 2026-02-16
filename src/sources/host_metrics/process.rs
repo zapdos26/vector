@@ -148,9 +148,7 @@ fn resolve_shm_owner(
     }
 
     // Only read maps if the process actually uses shared memory
-    let has_shm = proc_status
-        .and_then(|s| s.rssshmem)
-        .is_some_and(|v| v > 0);
+    let has_shm = proc_status.and_then(|s| s.rssshmem).is_some_and(|v| v > 0);
     if !has_shm {
         return None;
     }
