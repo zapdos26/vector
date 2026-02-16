@@ -40,6 +40,8 @@ mod network;
 mod process;
 #[cfg(target_os = "linux")]
 mod tcp;
+#[allow(dead_code)]
+mod uid_cache;
 
 /// Collector types.
 #[serde_as]
@@ -355,6 +357,8 @@ pub struct HostMetrics {
     system: System,
     #[cfg(target_os = "linux")]
     root_cgroup: Option<cgroups::CGroupRoot>,
+    #[allow(dead_code)]
+    uid_cache: uid_cache::UidCache,
     events_received: Registered<EventsReceived>,
 }
 
@@ -364,6 +368,7 @@ impl HostMetrics {
         Self {
             config,
             system: System::new(),
+            uid_cache: uid_cache::UidCache::new(),
             events_received: register!(EventsReceived),
         }
     }
@@ -376,6 +381,7 @@ impl HostMetrics {
             config,
             system: System::new(),
             root_cgroup,
+            uid_cache: uid_cache::UidCache::new(),
             events_received: register!(EventsReceived),
         }
     }
