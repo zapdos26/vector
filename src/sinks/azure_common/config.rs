@@ -106,6 +106,9 @@ pub struct AzureBlobEntraIdConfig {
 pub enum AzureBlobEntraAuthMethod {
     /// Use a default chain of credentials.
     ///
+    /// `azure_identity` (including the currently available newer releases) does not expose
+    /// a first-class `DefaultAzureCredential` type, so Vector models the default chain here.
+    ///
     /// Vector tries, in order:
     /// 1. configured client secret (`tenant_id`, `client_id`, `client_secret`)
     /// 2. workload identity
