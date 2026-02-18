@@ -104,19 +104,8 @@ pub struct AzureBlobEntraIdConfig {
 #[derive(Clone, Copy, Debug, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum AzureBlobEntraAuthMethod {
-    /// Use a default chain of credentials.
-    ///
-    /// `azure_identity` (including the currently available newer releases) does not expose
-    /// a first-class `DefaultAzureCredential` type, so Vector models the default chain here.
-    ///
-    /// Vector tries, in order:
-    /// 1. configured client secret (`tenant_id`, `client_id`, `client_secret`)
-    /// 2. workload identity
-    /// 3. managed identity
-    /// 4. developer tools (Azure CLI / Azure Developer CLI)
-    #[default]
-    DefaultAzureCredential,
     /// Use managed identity (system-assigned or user-assigned if `client_id` is set).
+    #[default]
     ManagedIdentity,
     /// Use service principal credentials from `tenant_id`, `client_id`, and `client_secret`.
     ClientSecret,
@@ -184,80 +173,7 @@ impl AzureBlobAuthConfig {
             AzureBlobEntraAuthMethod::DeveloperTools => DeveloperToolsCredential::new(None)
                 .map(|credential| credential as Arc<dyn TokenCredential>)
                 .map_err(|e| format!("failed to create developer tools credential: {e}").into()),
-            AzureBlobEntraAuthMethod::DefaultAzureCredential => {
-                let mut chain = Vec::new();
-                if let Ok(credential) = Self::client_secret_credential(entra_id) {
-                    chain.push(credential);
-                }
-                if let Ok(credential) = WorkloadIdentityCredential::new(None) {
-                    chain.push(credential as Arc<dyn TokenCredential>);
-                }
-                if let Ok(credential) = Self::managed_identity_credential(entra_id) {
-                    chain.push(credential);
-                }
-                if let Ok(credential) = DeveloperToolsCredential::new(None) {
-                    chain.push(credential as Arc<dyn TokenCredential>);
-                }
-
-                if chain.is_empty() {
-                    return Err(
-                        "failed to create any default azure credential source for `entra_id`"
-                            .into(),
-                    );
-                }
-
-                Ok(Arc::new(AzureBlobDefaultCredentialChain { sources: chain }))
-            }
         }
-    }
-}
-
-#[derive(Debug)]
-struct AzureBlobDefaultCredentialChain {
-    sources: Vec<Arc<dyn TokenCredential>>,
-}
-
-#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
-#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
-impl TokenCredential for AzureBlobDefaultCredentialChain {
-    async fn get_token(
-        &self,
-        scopes: &[&str],
-        options: Option<azure_core::credentials::TokenRequestOptions<'_>>,
-    ) -> azure_core::Result<azure_core::credentials::AccessToken> {
-        let mut messages = Vec::new();
-        let mut first_error = None;
-        let mut current_options = options;
-        for (idx, source) in self.sources.iter().enumerate() {
-            // Reuse the original options on the final attempt to avoid an unnecessary clone.
-            let request_options = if idx + 1 == self.sources.len() {
-                current_options.take()
-            } else {
-                current_options.clone()
-            };
-
-            match source.get_token(scopes, request_options).await {
-                Ok(token) => return Ok(token),
-                Err(error) => {
-                    messages.push(error.to_string());
-                    if first_error.is_none() {
-                        first_error = Some(error);
-                    }
-                }
-            }
-        }
-
-        let message = format!(
-            "all default azure credential sources failed: {}",
-            messages.join("; ")
-        );
-
-        let error = first_error.expect("at least one credential source should have been attempted");
-        Err(azure_core::Error::with_error(
-            azure_core::error::ErrorKind::Credential,
-            error,
-            message,
-        ))
     }
 }
 
