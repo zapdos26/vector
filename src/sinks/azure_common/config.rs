@@ -5,8 +5,8 @@ use azure_core::{
     error::Error as AzureCoreError,
 };
 use azure_identity::{
-    ClientSecretCredential, ManagedIdentityCredential, ManagedIdentityCredentialOptions,
-    UserAssignedId,
+    ClientSecretCredential, DeveloperToolsCredential, ManagedIdentityCredential,
+    ManagedIdentityCredentialOptions, UserAssignedId, WorkloadIdentityCredential,
 };
 
 use crate::sinks::azure_common::connection_string::{Auth, ParsedConnectionString};
@@ -93,20 +93,41 @@ pub struct AzureBlobEntraIdConfig {
     ///
     /// Must be provided together with `tenant_id`.
     pub client_secret: Option<SensitiveString>,
+
+    /// The Entra credential method to use.
+    #[serde(default)]
+    pub auth_method: AzureBlobEntraAuthMethod,
+}
+
+/// Credential method used for Entra authentication.
+#[configurable_component]
+#[derive(Clone, Copy, Debug, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AzureBlobEntraAuthMethod {
+    /// Use a default chain of credentials.
+    ///
+    /// Vector tries, in order:
+    /// 1. configured client secret (`tenant_id`, `client_id`, `client_secret`)
+    /// 2. workload identity
+    /// 3. managed identity
+    /// 4. developer tools (Azure CLI / Azure Developer CLI)
+    #[default]
+    DefaultAzureCredential,
+    /// Use managed identity (system-assigned or user-assigned if `client_id` is set).
+    ManagedIdentity,
+    /// Use service principal credentials from `tenant_id`, `client_id`, and `client_secret`.
+    ClientSecret,
+    /// Use workload identity.
+    WorkloadIdentity,
+    /// Use developer tools credentials (Azure CLI / Azure Developer CLI).
+    DeveloperTools,
 }
 
 impl AzureBlobAuthConfig {
-    fn token_credential(&self) -> crate::Result<Arc<dyn TokenCredential>> {
-        let entra_id = self
-            .entra_id
-            .as_ref()
-            .ok_or_else(|| "missing `entra_id` configuration".to_string())?;
-
-        match (
-            &entra_id.tenant_id,
-            &entra_id.client_id,
-            &entra_id.client_secret,
-        ) {
+    fn client_secret_credential(
+        entra_id: &AzureBlobEntraIdConfig,
+    ) -> crate::Result<Arc<dyn TokenCredential>> {
+        match (&entra_id.tenant_id, &entra_id.client_id, &entra_id.client_secret) {
             (Some(tenant_id), Some(client_id), Some(client_secret)) => ClientSecretCredential::new(
                 tenant_id,
                 client_id.clone(),
@@ -122,20 +143,99 @@ impl AzureBlobAuthConfig {
                 "`entra_id.tenant_id` and `entra_id.client_secret` must be provided together"
                     .into(),
             ),
-            (None, client_id, None) => {
-                let options = client_id
-                    .clone()
-                    .map(|id| ManagedIdentityCredentialOptions {
-                        user_assigned_id: Some(UserAssignedId::ClientId(id)),
-                        ..Default::default()
-                    });
-                ManagedIdentityCredential::new(options)
-                    .map(|credential| credential as Arc<dyn TokenCredential>)
-                    .map_err(|e| {
-                        format!("failed to create managed identity credential: {e}").into()
-                    })
+            _ => Err(
+                "`entra_id.tenant_id`, `entra_id.client_id`, and `entra_id.client_secret` are required for client_secret auth".into(),
+            ),
+        }
+    }
+
+    fn managed_identity_credential(
+        entra_id: &AzureBlobEntraIdConfig,
+    ) -> crate::Result<Arc<dyn TokenCredential>> {
+        let options = entra_id
+            .client_id
+            .clone()
+            .map(|id| ManagedIdentityCredentialOptions {
+                user_assigned_id: Some(UserAssignedId::ClientId(id)),
+                ..Default::default()
+            });
+        ManagedIdentityCredential::new(options)
+            .map(|credential| credential as Arc<dyn TokenCredential>)
+            .map_err(|e| format!("failed to create managed identity credential: {e}").into())
+    }
+
+    fn token_credential(&self) -> crate::Result<Arc<dyn TokenCredential>> {
+        let entra_id = self
+            .entra_id
+            .as_ref()
+            .ok_or_else(|| "missing `entra_id` configuration".to_string())?;
+
+        match entra_id.auth_method {
+            AzureBlobEntraAuthMethod::ClientSecret => Self::client_secret_credential(entra_id),
+            AzureBlobEntraAuthMethod::ManagedIdentity => {
+                Self::managed_identity_credential(entra_id)
+            }
+            AzureBlobEntraAuthMethod::WorkloadIdentity => WorkloadIdentityCredential::new(None)
+                .map(|credential| credential as Arc<dyn TokenCredential>)
+                .map_err(|e| format!("failed to create workload identity credential: {e}").into()),
+            AzureBlobEntraAuthMethod::DeveloperTools => DeveloperToolsCredential::new(None)
+                .map(|credential| credential as Arc<dyn TokenCredential>)
+                .map_err(|e| format!("failed to create developer tools credential: {e}").into()),
+            AzureBlobEntraAuthMethod::DefaultAzureCredential => {
+                let mut chain = Vec::new();
+                if let Ok(credential) = Self::client_secret_credential(entra_id) {
+                    chain.push(credential);
+                }
+                if let Ok(credential) = WorkloadIdentityCredential::new(None) {
+                    chain.push(credential as Arc<dyn TokenCredential>);
+                }
+                if let Ok(credential) = Self::managed_identity_credential(entra_id) {
+                    chain.push(credential);
+                }
+                if let Ok(credential) = DeveloperToolsCredential::new(None) {
+                    chain.push(credential as Arc<dyn TokenCredential>);
+                }
+
+                if chain.is_empty() {
+                    return Err(
+                        "failed to create any default azure credential source for `entra_id`"
+                            .into(),
+                    );
+                }
+
+                Ok(Arc::new(AzureBlobDefaultCredentialChain { sources: chain }))
             }
         }
+    }
+}
+
+#[derive(Debug)]
+struct AzureBlobDefaultCredentialChain {
+    sources: Vec<Arc<dyn TokenCredential>>,
+}
+
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+impl TokenCredential for AzureBlobDefaultCredentialChain {
+    async fn get_token(
+        &self,
+        scopes: &[&str],
+        options: Option<azure_core::credentials::TokenRequestOptions<'_>>,
+    ) -> azure_core::Result<azure_core::credentials::AccessToken> {
+        let mut errors = Vec::new();
+        for source in &self.sources {
+            match source.get_token(scopes, options.clone()).await {
+                Ok(token) => return Ok(token),
+                Err(error) => errors.push(error.to_string()),
+            }
+        }
+        Err(azure_core::Error::with_message(
+            azure_core::error::ErrorKind::Credential,
+            format!(
+                "all default azure credential sources failed: {}",
+                errors.join("; ")
+            ),
+        ))
     }
 }
 
@@ -339,7 +439,9 @@ pub fn build_client(
 
 #[cfg(test)]
 mod tests {
-    use super::{AzureBlobAuthConfig, AzureBlobEntraIdConfig, build_client};
+    use super::{
+        AzureBlobAuthConfig, AzureBlobEntraAuthMethod, AzureBlobEntraIdConfig, build_client,
+    };
 
     #[test]
     fn build_client_requires_connection_string_or_entra() {
@@ -372,6 +474,7 @@ mod tests {
                     tenant_id: Some("tenant".to_string()),
                     client_id: None,
                     client_secret: Some(String::from("secret").into()),
+                    auth_method: AzureBlobEntraAuthMethod::ClientSecret,
                 }),
             },
             "logs".to_string(),
