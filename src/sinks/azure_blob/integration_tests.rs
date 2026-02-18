@@ -30,7 +30,7 @@ use crate::{
 async fn azure_blob_healthcheck_passed() {
     let config = AzureBlobSinkConfig::new_emulator().await;
     let client = azure_common::config::build_client(
-        config.connection_string.clone().into(),
+        &config.auth,
         config.container_name.clone(),
         &crate::config::ProxyConfig::default(),
     )
@@ -50,7 +50,7 @@ async fn azure_blob_healthcheck_unknown_container() {
         ..config
     };
     let client = azure_common::config::build_client(
-        config.connection_string.clone().into(),
+        &config.auth,
         config.container_name.clone(),
         &crate::config::ProxyConfig::default(),
     )
@@ -215,10 +215,13 @@ impl AzureBlobSinkConfig {
     pub async fn new_emulator() -> AzureBlobSinkConfig {
         let address = std::env::var("AZURE_ADDRESS").unwrap_or_else(|_| "localhost".into());
         let config = AzureBlobSinkConfig {
-            connection_string: format!("UseDevelopmentStorage=true;DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://{address}:10000/devstoreaccount1;QueueEndpoint=http://{address}:10001/devstoreaccount1;TableEndpoint=http://{address}:10002/devstoreaccount1;").into(),
-                container_name: "logs".to_string(),
-                blob_prefix: Default::default(),
-                blob_time_format: None,
+            auth: azure_common::config::AzureBlobAuthConfig {
+                connection_string: format!("UseDevelopmentStorage=true;DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://{address}:10000/devstoreaccount1;QueueEndpoint=http://{address}:10001/devstoreaccount1;TableEndpoint=http://{address}:10002/devstoreaccount1;").into(),
+                entra_id: None,
+            },
+            container_name: "logs".to_string(),
+            blob_prefix: Default::default(),
+            blob_time_format: None,
                 blob_append_uuid: None,
                 encoding: (None::<FramingConfig>, TextSerializerConfig::default()).into(),
                 compression: Compression::None,
@@ -234,7 +237,7 @@ impl AzureBlobSinkConfig {
 
     fn to_sink(&self) -> VectorSink {
         let client = azure_common::config::build_client(
-            self.connection_string.clone().into(),
+            &self.auth,
             self.container_name.clone(),
             &crate::config::ProxyConfig::default(),
         )
@@ -252,7 +255,7 @@ impl AzureBlobSinkConfig {
 
     pub async fn list_blobs(&self, prefix: String) -> Vec<String> {
         let client = azure_common::config::build_client(
-            self.connection_string.clone().into(),
+            &self.auth,
             self.container_name.clone(),
             &crate::config::ProxyConfig::default(),
         )
@@ -277,7 +280,7 @@ impl AzureBlobSinkConfig {
 
     pub async fn get_blob(&self, blob: String) -> (Option<String>, Option<String>, Vec<String>) {
         let client = azure_common::config::build_client(
-            self.connection_string.clone().into(),
+            &self.auth,
             self.container_name.clone(),
             &crate::config::ProxyConfig::default(),
         )
@@ -338,7 +341,7 @@ impl AzureBlobSinkConfig {
 
     async fn ensure_container(&self) {
         let client = azure_common::config::build_client(
-            self.connection_string.clone().into(),
+            &self.auth,
             self.container_name.clone(),
             &crate::config::ProxyConfig::default(),
         )
