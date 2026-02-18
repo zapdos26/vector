@@ -224,12 +224,13 @@ impl TokenCredential for AzureBlobDefaultCredentialChain {
     ) -> azure_core::Result<azure_core::credentials::AccessToken> {
         let mut messages = Vec::new();
         let mut first_error = None;
-        let mut options = options;
+        let mut current_options = options;
         for (idx, source) in self.sources.iter().enumerate() {
+            // Reuse the original options on the final attempt to avoid an unnecessary clone.
             let request_options = if idx + 1 == self.sources.len() {
-                options.take()
+                current_options.take()
             } else {
-                options.clone()
+                current_options.clone()
             };
 
             match source.get_token(scopes, request_options).await {
@@ -248,18 +249,12 @@ impl TokenCredential for AzureBlobDefaultCredentialChain {
             messages.join("; ")
         );
 
-        if let Some(error) = first_error {
-            Err(azure_core::Error::with_error(
-                azure_core::error::ErrorKind::Credential,
-                error,
-                message,
-            ))
-        } else {
-            Err(azure_core::Error::with_message(
-                azure_core::error::ErrorKind::Credential,
-                message,
-            ))
-        }
+        let error = first_error.expect("at least one credential source should have been attempted");
+        Err(azure_core::Error::with_error(
+            azure_core::error::ErrorKind::Credential,
+            error,
+            message,
+        ))
     }
 }
 
