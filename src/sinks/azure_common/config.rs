@@ -65,15 +65,15 @@ pub struct AzureBlobAuthConfig {
     /// - managed identity (default), optionally with a user-assigned client ID, or
     /// - service principal credentials when `tenant_id` and `client_secret` are supplied.
     #[serde(default)]
-    pub entra_id: Option<AzureBlobEntraIdConfig>,
+    pub entra_id: Option<AzureEntraIdConfig>,
 }
 
-/// Microsoft Entra ID authentication options for Azure Blob Storage.
+/// Microsoft Entra ID authentication options for Azure integrations.
 #[configurable_component]
 #[derive(Clone, Debug)]
 #[serde(deny_unknown_fields)]
-pub struct AzureBlobEntraIdConfig {
-    /// The Blob service endpoint URL, e.g. `https://myaccount.blob.core.windows.net`.
+pub struct AzureEntraIdConfig {
+    /// The service endpoint URL, e.g. `https://myaccount.blob.core.windows.net`.
     #[configurable(metadata(docs::examples = "https://myaccount.blob.core.windows.net"))]
     pub endpoint: String,
 
@@ -96,14 +96,14 @@ pub struct AzureBlobEntraIdConfig {
 
     /// The Entra credential method to use.
     #[serde(default)]
-    pub auth_method: AzureBlobEntraAuthMethod,
+    pub auth_method: AzureEntraAuthMethod,
 }
 
 /// Credential method used for Entra authentication.
 #[configurable_component]
 #[derive(Clone, Copy, Debug, Default)]
 #[serde(rename_all = "snake_case")]
-pub enum AzureBlobEntraAuthMethod {
+pub enum AzureEntraAuthMethod {
     /// Use managed identity (system-assigned or user-assigned if `client_id` is set).
     #[default]
     ManagedIdentity,
@@ -117,7 +117,7 @@ pub enum AzureBlobEntraAuthMethod {
 
 impl AzureBlobAuthConfig {
     fn client_secret_credential(
-        entra_id: &AzureBlobEntraIdConfig,
+        entra_id: &AzureEntraIdConfig,
     ) -> crate::Result<Arc<dyn TokenCredential>> {
         match (&entra_id.tenant_id, &entra_id.client_id, &entra_id.client_secret) {
             (Some(tenant_id), Some(client_id), Some(client_secret)) => ClientSecretCredential::new(
@@ -142,7 +142,7 @@ impl AzureBlobAuthConfig {
     }
 
     fn managed_identity_credential(
-        entra_id: &AzureBlobEntraIdConfig,
+        entra_id: &AzureEntraIdConfig,
     ) -> crate::Result<Arc<dyn TokenCredential>> {
         let options = entra_id
             .client_id
@@ -163,19 +163,20 @@ impl AzureBlobAuthConfig {
             .ok_or_else(|| "missing `entra_id` configuration".to_string())?;
 
         match entra_id.auth_method {
-            AzureBlobEntraAuthMethod::ClientSecret => Self::client_secret_credential(entra_id),
-            AzureBlobEntraAuthMethod::ManagedIdentity => {
-                Self::managed_identity_credential(entra_id)
-            }
-            AzureBlobEntraAuthMethod::WorkloadIdentity => WorkloadIdentityCredential::new(None)
+            AzureEntraAuthMethod::ClientSecret => Self::client_secret_credential(entra_id),
+            AzureEntraAuthMethod::ManagedIdentity => Self::managed_identity_credential(entra_id),
+            AzureEntraAuthMethod::WorkloadIdentity => WorkloadIdentityCredential::new(None)
                 .map(|credential| credential as Arc<dyn TokenCredential>)
                 .map_err(|e| format!("failed to create workload identity credential: {e}").into()),
-            AzureBlobEntraAuthMethod::DeveloperTools => DeveloperToolsCredential::new(None)
+            AzureEntraAuthMethod::DeveloperTools => DeveloperToolsCredential::new(None)
                 .map(|credential| credential as Arc<dyn TokenCredential>)
                 .map_err(|e| format!("failed to create developer tools credential: {e}").into()),
         }
     }
 }
+
+pub type AzureBlobEntraIdConfig = AzureEntraIdConfig;
+pub type AzureBlobEntraAuthMethod = AzureEntraAuthMethod;
 
 #[derive(Debug, Clone)]
 pub struct AzureBlobRequest {
@@ -377,9 +378,7 @@ pub fn build_client(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        AzureBlobAuthConfig, AzureBlobEntraAuthMethod, AzureBlobEntraIdConfig, build_client,
-    };
+    use super::{AzureBlobAuthConfig, AzureEntraAuthMethod, AzureEntraIdConfig, build_client};
 
     #[test]
     fn build_client_requires_connection_string_or_entra() {
@@ -407,12 +406,12 @@ mod tests {
         let result = build_client(
             &AzureBlobAuthConfig {
                 connection_string: String::new().into(),
-                entra_id: Some(AzureBlobEntraIdConfig {
+                entra_id: Some(AzureEntraIdConfig {
                     endpoint: "https://example.blob.core.windows.net".to_string(),
                     tenant_id: Some("tenant".to_string()),
                     client_id: None,
                     client_secret: Some(String::from("secret").into()),
-                    auth_method: AzureBlobEntraAuthMethod::ClientSecret,
+                    auth_method: AzureEntraAuthMethod::ClientSecret,
                 }),
             },
             "logs".to_string(),
