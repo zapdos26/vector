@@ -222,20 +222,44 @@ impl TokenCredential for AzureBlobDefaultCredentialChain {
         scopes: &[&str],
         options: Option<azure_core::credentials::TokenRequestOptions<'_>>,
     ) -> azure_core::Result<azure_core::credentials::AccessToken> {
-        let mut errors = Vec::new();
-        for source in &self.sources {
-            match source.get_token(scopes, options.clone()).await {
+        let mut messages = Vec::new();
+        let mut first_error = None;
+        let mut options = options;
+        for (idx, source) in self.sources.iter().enumerate() {
+            let request_options = if idx + 1 == self.sources.len() {
+                options.take()
+            } else {
+                options.clone()
+            };
+
+            match source.get_token(scopes, request_options).await {
                 Ok(token) => return Ok(token),
-                Err(error) => errors.push(error.to_string()),
+                Err(error) => {
+                    messages.push(error.to_string());
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                }
             }
         }
-        Err(azure_core::Error::with_message(
-            azure_core::error::ErrorKind::Credential,
-            format!(
-                "all default azure credential sources failed: {}",
-                errors.join("; ")
-            ),
-        ))
+
+        let message = format!(
+            "all default azure credential sources failed: {}",
+            messages.join("; ")
+        );
+
+        if let Some(error) = first_error {
+            Err(azure_core::Error::with_error(
+                azure_core::error::ErrorKind::Credential,
+                error,
+                message,
+            ))
+        } else {
+            Err(azure_core::Error::with_message(
+                azure_core::error::ErrorKind::Credential,
+                message,
+            ))
+        }
     }
 }
 
