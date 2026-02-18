@@ -5,7 +5,6 @@ use tower::ServiceBuilder;
 use vector_lib::{
     codecs::{JsonSerializerConfig, NewlineDelimitedEncoderConfig, encoding::Framer},
     configurable::configurable_component,
-    sensitive_string::SensitiveString,
 };
 
 use super::request_builder::AzureBlobRequestOptions;
@@ -41,27 +40,8 @@ impl TowerRequestConfigDefaults for AzureBlobTowerRequestConfigDefaults {
 #[derive(Clone, Debug)]
 #[serde(deny_unknown_fields)]
 pub struct AzureBlobSinkConfig {
-    /// The Azure Blob Storage Account connection string.
-    ///
-    /// Authentication with an access key or shared access signature (SAS)
-    /// are supported authentication methods. If using a non-account SAS,
-    /// healthchecks will fail and will need to be disabled by setting
-    /// `healthcheck.enabled` to `false` for this sink
-    ///
-    /// When generating an account SAS, the following are the minimum required option
-    /// settings for Vector to access blob storage and pass a health check.
-    /// | Option                 | Value              |
-    /// | ---------------------- | ------------------ |
-    /// | Allowed services       | Blob               |
-    /// | Allowed resource types | Container & Object |
-    /// | Allowed permissions    | Read & Create      |
-    #[configurable(metadata(
-        docs::examples = "DefaultEndpointsProtocol=https;AccountName=mylogstorage;AccountKey=storageaccountkeybase64encoded;EndpointSuffix=core.windows.net"
-    ))]
-    #[configurable(metadata(
-        docs::examples = "BlobEndpoint=https://mylogstorage.blob.core.windows.net/;SharedAccessSignature=generatedsastoken"
-    ))]
-    pub connection_string: SensitiveString,
+    #[serde(flatten)]
+    pub auth: azure_common::config::AzureBlobAuthConfig,
 
     /// The Azure Blob Storage Account container name.
     #[configurable(metadata(docs::examples = "my-logs"))]
@@ -147,7 +127,10 @@ pub fn default_blob_prefix() -> Template {
 impl GenerateConfig for AzureBlobSinkConfig {
     fn generate_config() -> toml::Value {
         toml::Value::try_from(Self {
-            connection_string: String::from("DefaultEndpointsProtocol=https;AccountName=some-account-name;AccountKey=some-account-key;").into(),
+            auth: azure_common::config::AzureBlobAuthConfig {
+                connection_string: String::from("DefaultEndpointsProtocol=https;AccountName=some-account-name;AccountKey=some-account-key;").into(),
+                entra_id: None,
+            },
             container_name: String::from("logs"),
             blob_prefix: default_blob_prefix(),
             blob_time_format: Some(String::from("%s")),
@@ -167,7 +150,7 @@ impl GenerateConfig for AzureBlobSinkConfig {
 impl SinkConfig for AzureBlobSinkConfig {
     async fn build(&self, cx: SinkContext) -> Result<(VectorSink, Healthcheck)> {
         let client = azure_common::config::build_client(
-            self.connection_string.clone().into(),
+            &self.auth,
             self.container_name.clone(),
             cx.proxy(),
         )?;

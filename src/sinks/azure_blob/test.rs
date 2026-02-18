@@ -14,15 +14,21 @@ use super::{config::AzureBlobSinkConfig, request_builder::AzureBlobRequestOption
 use crate::{
     codecs::{Encoder, EncodingConfigWithFraming},
     event::{Event, LogEvent},
-    sinks::util::{
-        Compression,
-        request_builder::{EncodeResult, RequestBuilder},
+    sinks::{
+        azure_common,
+        util::{
+            Compression,
+            request_builder::{EncodeResult, RequestBuilder},
+        },
     },
 };
 
 fn default_config(encoding: EncodingConfigWithFraming) -> AzureBlobSinkConfig {
     AzureBlobSinkConfig {
-        connection_string: Default::default(),
+        auth: azure_common::config::AzureBlobAuthConfig {
+            connection_string: Default::default(),
+            entra_id: None,
+        },
         container_name: Default::default(),
         blob_prefix: Default::default(),
         blob_time_format: Default::default(),

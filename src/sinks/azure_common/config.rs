@@ -1,6 +1,13 @@
 use std::sync::Arc;
 
-use azure_core::error::Error as AzureCoreError;
+use azure_core::{
+    credentials::{Secret, TokenCredential},
+    error::Error as AzureCoreError,
+};
+use azure_identity::{
+    ClientSecretCredential, DeveloperToolsCredential, ManagedIdentityCredential,
+    ManagedIdentityCredentialOptions, UserAssignedId, WorkloadIdentityCredential,
+};
 
 use crate::sinks::azure_common::connection_string::{Auth, ParsedConnectionString};
 use crate::sinks::azure_common::shared_key_policy::SharedKeyAuthorizationPolicy;
@@ -12,8 +19,10 @@ use bytes::Bytes;
 use futures::FutureExt;
 use snafu::Snafu;
 use vector_lib::{
+    configurable::configurable_component,
     json_size::JsonSize,
     request_metadata::{GroupedCountByteSize, MetaDescriptive, RequestMetadata},
+    sensitive_string::SensitiveString,
     stream::DriverResponse,
 };
 
@@ -21,6 +30,153 @@ use crate::{
     event::{EventFinalizers, EventStatus, Finalizable},
     sinks::{Healthcheck, util::retries::RetryLogic},
 };
+
+/// Authentication settings for Azure Blob Storage sinks.
+#[configurable_component]
+#[derive(Clone, Debug)]
+#[serde(deny_unknown_fields)]
+pub struct AzureBlobAuthConfig {
+    /// The Azure Blob Storage Account connection string.
+    ///
+    /// Authentication with an access key or shared access signature (SAS)
+    /// are supported authentication methods. If using a non-account SAS,
+    /// healthchecks will fail and will need to be disabled by setting
+    /// `healthcheck.enabled` to `false` for this sink.
+    ///
+    /// When generating an account SAS, the following are the minimum required option
+    /// settings for Vector to access blob storage and pass a health check.
+    /// | Option                 | Value              |
+    /// | ---------------------- | ------------------ |
+    /// | Allowed services       | Blob               |
+    /// | Allowed resource types | Container & Object |
+    /// | Allowed permissions    | Read & Create      |
+    #[configurable(metadata(
+        docs::examples = "DefaultEndpointsProtocol=https;AccountName=mylogstorage;AccountKey=storageaccountkeybase64encoded;EndpointSuffix=core.windows.net"
+    ))]
+    #[configurable(metadata(
+        docs::examples = "BlobEndpoint=https://mylogstorage.blob.core.windows.net/;SharedAccessSignature=generatedsastoken"
+    ))]
+    #[serde(default)]
+    pub connection_string: SensitiveString,
+
+    /// Use Microsoft Entra ID authentication for Blob Storage.
+    ///
+    /// When configured, Vector obtains a bearer token using either:
+    /// - managed identity (default), optionally with a user-assigned client ID, or
+    /// - service principal credentials when `tenant_id` and `client_secret` are supplied.
+    #[serde(default)]
+    pub entra_id: Option<AzureEntraIdConfig>,
+}
+
+/// Microsoft Entra ID authentication options for Azure integrations.
+#[configurable_component]
+#[derive(Clone, Debug)]
+#[serde(deny_unknown_fields)]
+pub struct AzureEntraIdConfig {
+    /// The service endpoint URL, e.g. `https://myaccount.blob.core.windows.net`.
+    #[configurable(metadata(docs::examples = "https://myaccount.blob.core.windows.net"))]
+    pub endpoint: String,
+
+    /// The Entra tenant ID for service principal authentication.
+    ///
+    /// Must be provided together with `client_secret`.
+    #[configurable(metadata(docs::examples = "11111111-1111-1111-1111-111111111111"))]
+    pub tenant_id: Option<String>,
+
+    /// The Entra application (client) ID.
+    ///
+    /// For managed identity auth this is optional and selects a user-assigned identity.
+    #[configurable(metadata(docs::examples = "22222222-2222-2222-2222-222222222222"))]
+    pub client_id: Option<String>,
+
+    /// The Entra client secret for service principal authentication.
+    ///
+    /// Must be provided together with `tenant_id`.
+    pub client_secret: Option<SensitiveString>,
+
+    /// The Entra credential method to use.
+    #[serde(default)]
+    pub auth_method: AzureEntraAuthMethod,
+}
+
+/// Credential method used for Entra authentication.
+#[configurable_component]
+#[derive(Clone, Copy, Debug, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AzureEntraAuthMethod {
+    /// Use managed identity (system-assigned or user-assigned if `client_id` is set).
+    #[default]
+    ManagedIdentity,
+    /// Use service principal credentials from `tenant_id`, `client_id`, and `client_secret`.
+    ClientSecret,
+    /// Use workload identity.
+    WorkloadIdentity,
+    /// Use developer tools credentials (Azure CLI / Azure Developer CLI).
+    DeveloperTools,
+}
+
+impl AzureBlobAuthConfig {
+    fn client_secret_credential(
+        entra_id: &AzureEntraIdConfig,
+    ) -> crate::Result<Arc<dyn TokenCredential>> {
+        match (&entra_id.tenant_id, &entra_id.client_id, &entra_id.client_secret) {
+            (Some(tenant_id), Some(client_id), Some(client_secret)) => ClientSecretCredential::new(
+                tenant_id,
+                client_id.clone(),
+                Secret::new(client_secret.inner().to_owned()),
+                None,
+            )
+            .map(|credential| credential as Arc<dyn TokenCredential>)
+            .map_err(|e| format!("failed to create Entra client secret credential: {e}").into()),
+            (Some(_), None, Some(_)) => Err(
+                "`entra_id.client_id` is required when using tenant_id and client_secret".into(),
+            ),
+            (Some(_), _, None) | (None, _, Some(_)) => Err(
+                "`entra_id.tenant_id` and `entra_id.client_secret` must be provided together"
+                    .into(),
+            ),
+            _ => Err(
+                "`entra_id.tenant_id`, `entra_id.client_id`, and `entra_id.client_secret` are required for client_secret auth".into(),
+            ),
+        }
+    }
+
+    fn managed_identity_credential(
+        entra_id: &AzureEntraIdConfig,
+    ) -> crate::Result<Arc<dyn TokenCredential>> {
+        let options = entra_id
+            .client_id
+            .clone()
+            .map(|id| ManagedIdentityCredentialOptions {
+                user_assigned_id: Some(UserAssignedId::ClientId(id)),
+                ..Default::default()
+            });
+        ManagedIdentityCredential::new(options)
+            .map(|credential| credential as Arc<dyn TokenCredential>)
+            .map_err(|e| format!("failed to create managed identity credential: {e}").into())
+    }
+
+    fn token_credential(&self) -> crate::Result<Arc<dyn TokenCredential>> {
+        let entra_id = self
+            .entra_id
+            .as_ref()
+            .ok_or_else(|| "missing `entra_id` configuration".to_string())?;
+
+        match entra_id.auth_method {
+            AzureEntraAuthMethod::ClientSecret => Self::client_secret_credential(entra_id),
+            AzureEntraAuthMethod::ManagedIdentity => Self::managed_identity_credential(entra_id),
+            AzureEntraAuthMethod::WorkloadIdentity => WorkloadIdentityCredential::new(None)
+                .map(|credential| credential as Arc<dyn TokenCredential>)
+                .map_err(|e| format!("failed to create workload identity credential: {e}").into()),
+            AzureEntraAuthMethod::DeveloperTools => DeveloperToolsCredential::new(None)
+                .map(|credential| credential as Arc<dyn TokenCredential>)
+                .map_err(|e| format!("failed to create developer tools credential: {e}").into()),
+        }
+    }
+}
+
+pub type AzureBlobEntraIdConfig = AzureEntraIdConfig;
+pub type AzureBlobEntraAuthMethod = AzureEntraAuthMethod;
 
 #[derive(Debug, Clone)]
 pub struct AzureBlobRequest {
@@ -127,42 +283,52 @@ pub fn build_healthcheck(
 }
 
 pub fn build_client(
-    connection_string: String,
+    auth: &AzureBlobAuthConfig,
     container_name: String,
     proxy: &crate::config::ProxyConfig,
 ) -> crate::Result<Arc<BlobContainerClient>> {
-    // Parse connection string without legacy SDK
-    let parsed = ParsedConnectionString::parse(&connection_string)
-        .map_err(|e| format!("Invalid connection string: {e}"))?;
-    // Compose container URL (SAS appended if present)
-    let container_url = parsed
-        .container_url(&container_name)
-        .map_err(|e| format!("Failed to build container URL: {e}"))?;
-    let url = Url::parse(&container_url).map_err(|e| format!("Invalid container URL: {e}"))?;
-
-    // Prepare options; attach Shared Key policy if needed
     let mut options = BlobContainerClientOptions::default();
-    match parsed.auth() {
-        Auth::Sas { .. } | Auth::None => {
-            // No extra policy; SAS is in the URL already (or anonymous)
-        }
-        Auth::SharedKey {
-            account_name,
-            account_key,
-        } => {
-            let policy = SharedKeyAuthorizationPolicy::new(
+    let mut token_credential = None;
+    let url = if !auth.connection_string.inner().is_empty() {
+        // Parse connection string without legacy SDK
+        let parsed = ParsedConnectionString::parse(auth.connection_string.inner())
+            .map_err(|e| format!("Invalid connection string: {e}"))?;
+        // Compose container URL (SAS appended if present)
+        let container_url = parsed
+            .container_url(&container_name)
+            .map_err(|e| format!("Failed to build container URL: {e}"))?;
+        let url = Url::parse(&container_url).map_err(|e| format!("Invalid container URL: {e}"))?;
+
+        // Prepare options; attach Shared Key policy if needed
+        match parsed.auth() {
+            Auth::Sas { .. } | Auth::None => {
+                // No extra policy; SAS is in the URL already (or anonymous)
+            }
+            Auth::SharedKey {
                 account_name,
                 account_key,
-                // Use an Azurite-supported storage service version
-                String::from("2025-11-05"),
-            )
-            .map_err(|e| format!("Failed to create SharedKey policy: {e}"))?;
-            options
-                .client_options
-                .per_call_policies
-                .push(Arc::new(policy));
+            } => {
+                let policy = SharedKeyAuthorizationPolicy::new(
+                    account_name,
+                    account_key,
+                    // Use an Azurite-supported storage service version
+                    String::from("2025-11-05"),
+                )
+                .map_err(|e| format!("Failed to create SharedKey policy: {e}"))?;
+                options
+                    .client_options
+                    .per_call_policies
+                    .push(Arc::new(policy));
+            }
         }
-    }
+        url
+    } else {
+        let entra_id = auth.entra_id.as_ref().ok_or_else(|| {
+            "either `connection_string` or `entra_id` must be configured".to_string()
+        })?;
+        token_credential = Some(auth.token_credential()?);
+        Url::parse(&entra_id.endpoint).map_err(|e| format!("Invalid Entra endpoint URL: {e}"))?
+    };
 
     // Use reqwest v0.12 since Azure SDK only implements HttpClient for reqwest::Client v0.12
     let mut reqwest_builder = reqwest_12::ClientBuilder::new();
@@ -196,7 +362,69 @@ pub fn build_client(
             .build()
             .map_err(|e| format!("Failed to build reqwest client: {e}"))?,
     )));
-    let client =
-        BlobContainerClient::from_url(url, None, Some(options)).map_err(|e| format!("{e}"))?;
+    let client = if let Some(credential) = token_credential {
+        BlobContainerClient::new(
+            url.as_str(),
+            &container_name,
+            Some(credential),
+            Some(options),
+        )
+        .map_err(|e| format!("{e}"))?
+    } else {
+        BlobContainerClient::from_url(url, None, Some(options)).map_err(|e| format!("{e}"))?
+    };
     Ok(Arc::new(client))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AzureBlobAuthConfig, AzureEntraAuthMethod, AzureEntraIdConfig, build_client};
+
+    #[test]
+    fn build_client_requires_connection_string_or_entra() {
+        let result = build_client(
+            &AzureBlobAuthConfig {
+                connection_string: String::new().into(),
+                entra_id: None,
+            },
+            "logs".to_string(),
+            &crate::config::ProxyConfig::default(),
+        );
+
+        match result {
+            Ok(_) => panic!("expected missing auth configuration to fail"),
+            Err(error) => assert!(
+                error
+                    .to_string()
+                    .contains("either `connection_string` or `entra_id`")
+            ),
+        }
+    }
+
+    #[test]
+    fn entra_client_secret_requires_client_id() {
+        let result = build_client(
+            &AzureBlobAuthConfig {
+                connection_string: String::new().into(),
+                entra_id: Some(AzureEntraIdConfig {
+                    endpoint: "https://example.blob.core.windows.net".to_string(),
+                    tenant_id: Some("tenant".to_string()),
+                    client_id: None,
+                    client_secret: Some(String::from("secret").into()),
+                    auth_method: AzureEntraAuthMethod::ClientSecret,
+                }),
+            },
+            "logs".to_string(),
+            &crate::config::ProxyConfig::default(),
+        );
+
+        match result {
+            Ok(_) => panic!("expected incomplete client secret auth config to fail"),
+            Err(error) => assert!(
+                error
+                    .to_string()
+                    .contains("`entra_id.client_id` is required")
+            ),
+        }
+    }
 }
