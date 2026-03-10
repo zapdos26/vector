@@ -249,6 +249,7 @@ hfs
 highlighters
 hostagent
 hostcall
+hostinfo
 hostpath
 hoverable
 hoverbear
